@@ -6,7 +6,7 @@
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-tags: ["DW4", "iDEM"]
+tags: ["DW4", "iEFM"]
 
 seed: 12345
 
@@ -17,8 +17,8 @@ logger:
 
 defaults:
   - override /energy: dw4
+  - override /model: efm
   - override /model/net: egnn
-  - override /model/noise_schedule: geometric
 
 optimizer:
   lr: 1e-3
@@ -31,11 +31,6 @@ model:
     n_dimension: 2
 
   nll_with_cfm: true
-
-  noise_schedule:
-    _target_: dem.models.components.noise_schedules.GeometricNoiseSchedule
-    sigma_min: 0.00001
-    sigma_max: 3
 
   partial_prior:
     _target_: dem.energies.base_prior.MeanFreePrior

@@ -49,6 +49,7 @@ def estimate_grad_Rt(
     noise_schedule: BaseNoiseSchedule,
     num_mc_samples: int,
 ):
+    # if t is scalar, enumerate t to match with size of x.
     if t.ndim == 0:
         t = t.unsqueeze(0).repeat(len(x))
 

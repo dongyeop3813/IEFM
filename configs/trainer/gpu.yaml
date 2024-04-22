@@ -2,4 +2,4 @@ defaults:
   - default
 
 accelerator: cuda
-devices: 1
+devices: 4

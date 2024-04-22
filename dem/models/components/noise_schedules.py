@@ -78,3 +78,16 @@ class GeometricNoiseSchedule(BaseNoiseSchedule):
         # Then h(t) = \int_0^t g(z)^2 dz = sigma_min * sqrt{sigma_d^{2t} - 1}
         # see Eq 199 in https://arxiv.org/pdf/2206.00364.pdf
         return (self.sigma_min * (((self.sigma_diff ** (2 * t)) - 1) ** 0.5)) ** 2
+
+
+class OTcnfNoiseSchedule(BaseNoiseSchedule):
+    def __init__(self, sigma_min):
+        self.sigma_min = sigma_min
+
+    def g(self, t):
+        raise NotImplementedError
+
+    def h(self, t):
+        # Noise schedule of OT probability path
+        # see Eq 20 in (Flow matching, Lipman et al., 2023)
+        return (1 - (1 - self.sigma_min) * t) ** 2

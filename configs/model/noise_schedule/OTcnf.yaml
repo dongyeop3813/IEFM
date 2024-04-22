@@ -1,0 +1,2 @@
+_target_: dem.models.components.noise_schedules.OTcnfNoiseSchedule
+sigma_min: 0.001
