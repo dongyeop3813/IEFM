@@ -1,4 +1,5 @@
 import time
+from functools import partial
 from typing import Any, Dict, Optional
 
 import hydra
@@ -17,21 +18,19 @@ from torchmetrics import MeanMetric
 
 from dem.energies.base_energy_function import BaseEnergyFunction
 from dem.utils.data_utils import remove_mean
-from dem.utils.logging_utils import fig_to_image
+from dem.energies.gmm_energy import plot_vecfield_error
 
 from .components.clipper import Clipper
 from .components.cnf import CNF
 from .components.distribution_distances import compute_distribution_distances
 from .components.ema import EMAWrapper
 from .components.lambda_weighter import BaseLambdaWeighter
-from .components.mlp import TimeConder
 from .components.noise_schedules import BaseNoiseSchedule
 from .components.prioritised_replay_buffer import PrioritisedReplayBuffer
 from .components.scaling_wrapper import ScalingWrapper
-from .components.vf_estimator import estimate_VF
+from .components.vf_estimator import estimate_VF, estimate_VF_for_fixed_time
 from .components.score_estimator import estimate_grad_Rt, wrap_for_richardsons
 from .components.score_scaler import BaseScoreScaler
-from .components.sde_integration import integrate_sde
 from .components.sdes import VEReverseSDE
 
 
@@ -145,6 +144,7 @@ class EFMLitModule(LightningModule):
         version=1,
         negative_time=False,
         num_negative_time_steps=100,
+        prob_path='OT',
     ) -> None:
         """Initialize a `MNISTLitModule`.
 
@@ -189,6 +189,8 @@ class EFMLitModule(LightningModule):
             num_steps=num_integration_steps,
             atol=tol,
             rtol=tol,
+            start_time=0.01,
+            end_time=1.0,
         )
         self.cfm_cnf = CNF(
             self.cfm_net,
@@ -304,6 +306,8 @@ class EFMLitModule(LightningModule):
         self.diffusion_scale = diffusion_scale
         self.init_from_prior = init_from_prior
 
+        self.prob_path = prob_path
+
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
 
@@ -342,7 +346,13 @@ class EFMLitModule(LightningModule):
             self.energy_function,
             self.noise_schedule,
             num_mc_samples=self.num_estimator_mc_samples,
+            device=self.device,
+            option=self.prob_path,
         )
+
+        if estimated_VF.isnan().max():
+            print(estimated_VF)
+            raise Exception
 
         if self.clipper is not None and self.clipper.should_clip_scores:
             if self.energy_function.is_molecule:
@@ -366,6 +376,39 @@ class EFMLitModule(LightningModule):
 
         return self.lambda_weighter(times) * error_norms
 
+    def sample_time(self, num_samples, device):
+        """
+            Sample time points from uniform distribution on [0.01, 1].
+        """
+        t = 0.99 * torch.rand((num_samples,), device=device) + 0.01
+        return t
+
+    def sample_noisy_data(self, times, origins):
+        """
+            Sample perturbed data at time t for given origin data points.
+            Here, times and origins are batch.
+        """
+
+        sigma_t = self.noise_schedule.h(times).sqrt().unsqueeze(-1)
+
+        if self.prob_path == 'OT':
+            noisy_data = times.unsqueeze(1) * origins + (
+                torch.randn_like(origins) * sigma_t
+            )
+        elif self.prob_path == 'VE':
+            noisy_data = origins + (
+                torch.randn_like(origins) * sigma_t
+            )
+
+        if self.energy_function.is_molecule:
+            noisy_data = remove_mean(
+                noisy_data,
+                self.energy_function.n_particles,
+                self.energy_function.n_spatial_dim,
+            )
+
+        return noisy_data
+
     def training_step(self, batch, batch_idx):
         loss = 0.0
         if not self.hparams.debug_use_train_data:
@@ -374,20 +417,15 @@ class EFMLitModule(LightningModule):
             else:
                 iter_samples = self.prior.sample(self.num_samples_to_sample_from_buffer)
 
-            times = torch.rand(
-                (self.num_samples_to_sample_from_buffer,), device=iter_samples.device
+            times = self.sample_time(
+                num_samples=self.num_samples_to_sample_from_buffer, 
+                device=iter_samples.device
             )
 
-            noised_samples = times.unsqueeze(1) * iter_samples + (
-                torch.randn_like(iter_samples) * self.noise_schedule.h(times).sqrt().unsqueeze(-1)
+            noised_samples = self.sample_noisy_data(
+                times=times,
+                origins=iter_samples,
             )
-
-            if self.energy_function.is_molecule:
-                noised_samples = remove_mean(
-                    noised_samples,
-                    self.energy_function.n_particles,
-                    self.energy_function.n_spatial_dim,
-                )
 
             dem_loss = self.get_loss(times, noised_samples)
             self.log_dict(
@@ -411,8 +449,9 @@ class EFMLitModule(LightningModule):
                 cfm_samples = self.energy_function.sample_train_set(
                     self.num_samples_to_sample_from_buffer
                 )
-                times = torch.rand(
-                    (self.num_samples_to_sample_from_buffer,), device=cfm_samples.device
+                times = self.sample_time(
+                    num_samples=self.num_samples_to_sample_from_buffer,
+                    device=cfm_samples.device
                 )
             else:
                 cfm_samples, _, _ = self.buffer.sample(
@@ -451,10 +490,10 @@ class EFMLitModule(LightningModule):
     ) -> torch.Tensor:
         num_samples = num_samples or self.num_samples_to_generate_per_epoch
 
-        samples = self.prior.sample(num_samples)
+        sample_from_X0 = self.prior.sample(num_samples)
 
         return self.integrate(
-            samples=samples,
+            samples=sample_from_X0,
             return_full_trajectory=return_full_trajectory,
         )
 
@@ -464,7 +503,8 @@ class EFMLitModule(LightningModule):
         return_full_trajectory=False,
     ) -> torch.Tensor:
 
-        trajectory = self.efm_cnf.to(self.device).generate(samples).detach()
+        with torch.no_grad():
+            trajectory = self.efm_cnf.to(self.device).generate(samples).detach()
 
         if return_full_trajectory:
             return trajectory
@@ -489,15 +529,9 @@ class EFMLitModule(LightningModule):
 
     def on_train_epoch_end(self) -> None:
         "Lightning hook that is called when a training epoch ends."
-        if self.clipper_gen is not None:
-            reverse_sde = VEReverseSDE(
-                self.clipper_gen.wrap_grad_fxn(self.net), self.noise_schedule
-            )
-            self.last_samples = self.generate_samples()
-            self.last_energies = self.energy_function(self.last_samples)
-        else:
-            self.last_samples = self.generate_samples()
-            self.last_energies = self.energy_function(self.last_samples)
+
+        self.last_samples = self.generate_samples()
+        self.last_energies = self.energy_function(self.last_samples)
 
         self.buffer.add(self.last_samples, self.last_energies)
 
@@ -633,6 +667,27 @@ class EFMLitModule(LightningModule):
         )
         return forwards_samples
 
+    def _fixed_time_forward(self, t):
+        def _fxn(x):
+            return self.forward(t.repeat(x.size(0)), x)
+        return _fxn
+
+    def log_vecfield_error_plot(self) -> None:
+        true_vf = partial(
+            estimate_VF_for_fixed_time,
+            torch.tensor(0.5, device=self.device),
+            energy_function=self.energy_function,
+            noise_schedule=self.noise_schedule,
+            num_mc_samples=1000,
+            device=self.device,
+            option=self.prob_path
+        )
+        est_vf = self._fixed_time_forward(torch.tensor(0.5, device=self.device))
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        plot_vecfield_error(fig, ax, true_vf, est_vf, grid_step=40, device=self.device)
+        fig.savefig(f"./figure/GMM-Net-VF-error.png")
+
     def eval_step(self, prefix: str, batch: torch.Tensor, batch_idx: int) -> None:
         """Perform a single eval step on a batch of data from the validation set.
 
@@ -645,37 +700,35 @@ class EFMLitModule(LightningModule):
         elif prefix == "val":
             batch = self.energy_function.sample_val_set(self.eval_batch_size)
 
-        backwards_samples = self.last_samples
+        if self.energy_function.name == "gmm":
+            self.log_vecfield_error_plot()
+
+        sample = self.last_samples
 
         # generate samples noise --> data if needed
-        if backwards_samples is None or self.eval_batch_size > len(backwards_samples):
-            backwards_samples = self.generate_samples(
-                num_samples=self.eval_batch_size
-            )
+        if sample is None or self.eval_batch_size > len(sample):
+            sample = self.generate_samples(self.eval_batch_size)
 
         # sample eval_batch_size from generated samples from dem to match dimensions
         # required for distribution metrics
-        if len(backwards_samples) != self.eval_batch_size:
-            indices = torch.randperm(len(backwards_samples))[: self.eval_batch_size]
-            backwards_samples = backwards_samples[indices]
+        if len(sample) != self.eval_batch_size:
+            indices = torch.randperm(len(sample))[: self.eval_batch_size]
+            sample = sample[indices]
 
         if batch is None:
             print("Warning batch is None skipping eval")
-            self.eval_step_outputs.append({"gen_0": backwards_samples})
+            self.eval_step_outputs.append({"gen_0": sample})
             return
 
-        times = torch.rand((self.eval_batch_size,), device=batch.device)
-
-        noised_batch = times.unsqueeze(1) * batch + (
-            torch.randn_like(batch) * self.noise_schedule.h(times).sqrt().unsqueeze(-1)
+        times = self.sample_time(
+            num_samples=self.eval_batch_size,
+            device=batch.device,
         )
 
-        if self.energy_function.is_molecule:
-            noised_batch = remove_mean(
-                noised_batch,
-                self.energy_function.n_particles,
-                self.energy_function.n_spatial_dim,
-            )
+        noised_batch = self.sample_noisy_data(
+            times=times,
+            origins=batch,
+        )
 
         loss = self.get_loss(times, noised_batch).mean(-1)
 
@@ -687,7 +740,7 @@ class EFMLitModule(LightningModule):
 
         to_log = {
             "data_0": batch,
-            "gen_0": backwards_samples,
+            "gen_0": sample,
         }
 
         if self.nll_with_dem:
@@ -696,7 +749,7 @@ class EFMLitModule(LightningModule):
                 self.efm_cnf, self.prior, batch, prefix, "dem_"
             )
             to_log["gen_1_dem"] = forwards_samples
-            self.compute_log_z(self.cfm_cnf, self.prior, backwards_samples, prefix, "dem_")
+            self.compute_log_z(self.cfm_cnf, self.prior, sample, prefix, "dem_")
         if self.nll_with_cfm:
             forwards_samples = self.compute_and_log_nll(
                 self.cfm_cnf, self.cfm_prior, batch, prefix, ""
@@ -718,11 +771,10 @@ class EFMLitModule(LightningModule):
                 )
 
         if self.logz_with_cfm:
-            backwards_samples = self.cfm_cnf.generate(
+            sample = self.cfm_cnf.generate(
                 self.cfm_prior.sample(self.eval_batch_size),
             )[-1]
-            # backwards_samples = self.generate_cfm_samples(self.eval_batch_size)
-            self.compute_log_z(self.cfm_cnf, self.cfm_prior, backwards_samples, prefix, "")
+            self.compute_log_z(self.cfm_cnf, self.cfm_prior, sample, prefix, "")
 
         self.eval_step_outputs.append(to_log)
 
@@ -834,24 +886,11 @@ class EFMLitModule(LightningModule):
         :param stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
         """
 
-        def _grad_fxn(t, x):
-            return self.clipped_grad_fxn(
-                t,
-                x,
-                self.energy_function,
-                self.noise_schedule,
-                self.num_estimator_mc_samples,
-            )
-
-        reverse_sde = VEReverseSDE(_grad_fxn, self.noise_schedule)
-
         self.prior = self.partial_prior(device=self.device, scale=self.noise_schedule.h(0) ** 0.5)
         if self.init_from_prior:
             init_states = self.prior.sample(self.num_init_samples)
         else:
-            init_states = self.generate_samples(
-                num_samples=self.num_init_samples
-            )
+            init_states = self.generate_samples(self.num_init_samples)
         init_energies = self.energy_function(init_states)
 
         self.buffer.add(init_states, init_energies)
