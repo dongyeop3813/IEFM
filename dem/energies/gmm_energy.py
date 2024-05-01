@@ -1,6 +1,10 @@
-from typing import Optional
+from typing import Optional, Callable
 
+import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
+
 import torch
 from fab.target_distributions import gmm
 from fab.utils.plotting import plot_contours, plot_marginal_pair
@@ -9,6 +13,69 @@ from lightning.pytorch.loggers import WandbLogger
 from dem.energies.base_energy_function import BaseEnergyFunction
 from dem.models.components.replay_buffer import ReplayBuffer
 from dem.utils.logging_utils import fig_to_image
+
+
+def plot_vecfield(
+    ax: Axes,
+    vecfield: Callable[[torch.Tensor], torch.Tensor],
+    grid_step: int = 20,
+    plotting_bounds: tuple = (-1.4 * 40, 1.4 * 40),
+    device: str = 'cpu',
+    debug = False,
+):
+    """
+        Draw vec field quiver plot.
+        Here, given vf must be batch-support version.
+    """
+
+    x_coord, y_coord = np.meshgrid(
+        np.linspace(*plotting_bounds, grid_step), 
+        np.linspace(*plotting_bounds, grid_step)
+    )
+    x = torch.tensor(
+        np.stack([x_coord, y_coord]), dtype=torch.float, device=device
+    ).permute((1, 2, 0)).view(grid_step ** 2, 2)
+
+    vectors = vecfield(x).detach()
+
+    if debug:
+        print(f"Mean norm of vecfields: {vectors.norm(p=2, dim=-1).mean()}")
+        print(f"Max norm of vecfields: {vectors.norm(p=2, dim=-1).max()}")
+
+    ax.quiver(x_coord, y_coord, vectors[:,0], vectors[:,1])
+
+
+def plot_vecfield_error(
+    fig: Figure,
+    ax: Axes,
+    true_vf: Callable[[torch.Tensor], torch.Tensor],
+    est_vf: Callable[[torch.Tensor], torch.Tensor],
+    grid_step: int = 20,
+    plotting_bounds: tuple = (-1.4 * 40, 1.4 * 40),
+    device: str = 'cpu',
+):
+    """
+        Draw color plot representing error between two vfs.
+        Here, given vfs must be batch-support version.
+    """
+
+    x_coord, y_coord = np.meshgrid(
+        np.linspace(*plotting_bounds, grid_step), 
+        np.linspace(*plotting_bounds, grid_step)
+    )
+    x = torch.tensor(
+        np.stack([x_coord, y_coord]), dtype=torch.float, device=device,
+    ).permute((1, 2, 0)).view(grid_step ** 2, 2)
+
+    true_vecs = true_vf(x).detach()
+    est_vecs = est_vf(x).detach()
+
+    err_grid = (est_vecs - true_vecs).norm(p=2, dim=-1).view(grid_step, grid_step).cpu()
+
+    img = ax.imshow(err_grid, extent=plotting_bounds * 2)
+    fig.colorbar(img, ax=ax)
+
+    ax.set_title("Error between two vector fields")
 
 
 class GMM(BaseEnergyFunction):
