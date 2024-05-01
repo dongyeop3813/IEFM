@@ -81,8 +81,10 @@ class GeometricNoiseSchedule(BaseNoiseSchedule):
 
 
 class OTcnfNoiseSchedule(BaseNoiseSchedule):
-    def __init__(self, sigma_min):
+    def __init__(self, sigma_min, sigma_max=1.0):
         self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_diff = sigma_min / sigma_max
 
     def g(self, t):
         raise NotImplementedError
@@ -90,4 +92,24 @@ class OTcnfNoiseSchedule(BaseNoiseSchedule):
     def h(self, t):
         # Noise schedule of OT probability path
         # see Eq 20 in (Flow matching, Lipman et al., 2023)
-        return (1 - (1 - self.sigma_min) * t) ** 2
+        return (
+            self.sigma_max - (self.sigma_max - self.sigma_min) * t
+        ) ** 2
+
+
+class VEcnfNoiseSchedule(BaseNoiseSchedule):
+    def __init__(self, sigma_min, sigma_max=1.0):
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_diff = sigma_min / sigma_max
+
+    def g(self, t):
+        raise NotImplementedError
+
+    def h(self, t):
+        # Noise schedule of OT probability path
+        # see Eq 20 in (Flow matching, Lipman et al., 2023)
+        return (
+            self.sigma_max * ((self.sigma_diff) ** t)
+        ) ** 2
+
