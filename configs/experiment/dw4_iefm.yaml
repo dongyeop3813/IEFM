@@ -32,6 +32,10 @@ model:
 
   nll_with_cfm: true
 
+  noise_schedule:
+    sigma_min: 0.00001
+    sigma_max: 3
+
   partial_prior:
     _target_: dem.energies.base_prior.MeanFreePrior
     _partial_: true
@@ -44,7 +48,7 @@ model:
 
   clipper:
     _target_: dem.models.components.clipper.Clipper
-    should_clip_scores: True
+    should_clip_scores: False
     should_clip_log_rewards: False
     max_score_norm: 20
     min_log_reward: null

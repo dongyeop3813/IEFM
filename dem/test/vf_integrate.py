@@ -1,5 +1,5 @@
-from functools import partial
 import argparse
+import wandb
 
 import torch
 import matplotlib.pyplot as plt
@@ -11,16 +11,18 @@ from dem.models.components.vf_estimator import estimate_VF
 from dem.models.components.optimal_transport import wasserstein
 from dem.energies.gmm_energy import GMM
 from dem.energies.multi_double_well_energy import MultiDoubleWellEnergy
+from dem.energies.lennardjones_energy import LennardJonesEnergy
 
 from fab.utils.plotting import plot_contours, plot_marginal_pair
-
-import ot as pot
 
 from torchdiffeq import odeint
 
 
 SAMPLE_SIZE = 1000
 INTEGRATION_METHOD = 'dopri5'
+
+FILTER_OUTLIER = True
+THRESHOLD = -10
 
 
 def parse_args():
@@ -39,23 +41,24 @@ def parse_args():
     return args
 
 
-def get_filename(sigma_max, sigma_min, num_mc_samples, start_time, end_time, prob_path):
-    filename = f'./figure/VF_integration/{ENERGY_FUNCTION}-{prob_path}/sample'
+def get_filename(cfg):
+    filename = './figure/VF_integration/' \
+        f'{cfg.energy_function}-{cfg.prob_path}/sample'
 
-    if sigma_max != 1.0:
-        filename += f'-sgM={sigma_max:0.2f}'
+    if cfg.sigma_max != 1.0:
+        filename += f'-sgM={cfg.sigma_max:0.2f}'
 
-    if sigma_min != 1e-5:
-        filename += f'-sgm={sigma_min:0.5f}'
+    if cfg.sigma_min != 1e-5:
+        filename += f'-sgm={cfg.sigma_min:0.5f}'
 
-    if num_mc_samples != 1000:
-        filename += f'-K={num_mc_samples}'
+    if cfg.num_mc_samples != 1000:
+        filename += f'-K={cfg.num_mc_samples}'
 
-    if start_time != 0.01:
-        filename += f'-s={start_time:0.3f}'
+    if cfg.start_time != 0.01:
+        filename += f'-s={cfg.start_time:0.3f}'
 
-    if end_time != 1.0:
-        filename += f'-e={end_time:0.2f}'
+    if cfg.end_time != 1.0:
+        filename += f'-e={cfg.end_time:0.2f}'
 
     filename += '.png'
 
@@ -64,12 +67,6 @@ def get_filename(sigma_max, sigma_min, num_mc_samples, start_time, end_time, pro
 
 def wasserstein2(energy_function, sample):
     test_set = energy_function.sample_test_set(SAMPLE_SIZE)
-
-    # sample_energies = energy_function(energy_function.normalize(sample))
-    # test_energies = energy_function(energy_function.normalize(test_set))
-
-    # energy_w2 = pot.emd2_1d(test_energies.cpu().numpy(), sample_energies.cpu().numpy())
-
     return wasserstein(test_set, sample, power=2)
 
 
@@ -171,38 +168,29 @@ def draw_trajectory_figure(ax, log_prob, trajectory, plotting_bounds):
     ax.plot(trajectory[:,sample_idx,0], trajectory[:,sample_idx,1])
 
 
-if __name__ == "__main__":
-    args = parse_args()
-
-    sigma_max = args.sigma_max
-    sigma_min = args.sigma_min
-    num_mc_samples = args.num_mc_samples
-    start_time = args.start_time
-    prob_path = args.prob_path
-    ENERGY_FUNCTION = args.energy_function
-
-    num_steps = 1000
-    end_time = 1.0
-
-    device = get_device()
-
-    if prob_path == 'OT':
-        noise_schedule = OTcnfNoiseSchedule(sigma_min, sigma_max)
-    elif prob_path == 'VE':
-        noise_schedule = VEcnfNoiseSchedule(sigma_min, sigma_max)
-    else:
-        raise Exception("Invalid prob path")
-
-    if ENERGY_FUNCTION == "GMM":
-        energy_function = GMM(device=device)
-    elif ENERGY_FUNCTION == "DW4":
+def get_energy_function(cfg):
+    if cfg.energy_function == "GMM":
+        energy_function = GMM(device=cfg.device)
+    elif cfg.energy_function == "DW4":
         energy_function = MultiDoubleWellEnergy(
             8,
             4,
             "data/test_split_DW4.npy",
             "data/train_split_DW4.npy",
             "data/val_split_DW4.npy",
-            device=device,
+            device=cfg.device,
+            plot_samples_epoch_period=1,
+            data_normalization_factor=1.0,
+            is_molecule=True,
+        )
+    elif cfg.energy_function == "LJ13":
+        energy_function = LennardJonesEnergy(
+            39,
+            13,
+            "data/test_split_LJ13-1000.npy",
+            "data/train_split_LJ13-1000.npy",
+            "data/test_split_LJ13-1000.npy",
+            device=cfg.device,
             plot_samples_epoch_period=1,
             data_normalization_factor=1.0,
             is_molecule=True,
@@ -210,37 +198,99 @@ if __name__ == "__main__":
     else:
         raise Exception("Invalid energy function")
 
-    print('[+] Information:')
-    print(f'\t Energy_function: {ENERGY_FUNCTION}')
-    print(f'\t prob_path: {prob_path}')
-    print(f'\t sigma_max: {sigma_max}')
-    print(f'\t sigma_min: {sigma_min}')
-    print(f'\t num_mc_samples: {num_mc_samples}')
-    print(f'\t start_time: {start_time}')
+    return energy_function
 
-    x = sample_from_prior(sigma_max, dim=energy_function.dimensionality, device=device)
-    time = torch.linspace(start_time, end_time, num_steps + 1, device=device)
+
+def get_noise_schedule(cfg):
+    if cfg.prob_path == 'OT':
+        noise_schedule = OTcnfNoiseSchedule(cfg.sigma_min, cfg.sigma_max)
+    elif cfg.prob_path == 'VE':
+        noise_schedule = VEcnfNoiseSchedule(cfg.sigma_min, cfg.sigma_max)
+    else:
+        raise Exception("Invalid prob path")
+    return noise_schedule
+
+
+def filter_outlier(sample):
+    # E(x) = -energy_function(x)
+    sample_energy = -energy_function(sample)
+    indices = sample_energy < THRESHOLD
+    SAMPLE_SIZE = indices.sum()
+    return sample[indices]
+
+
+def draw_figure_and_save(cfg, energy_function, trajectory, w2=None):
+    if cfg.energy_function == "GMM":
+        fig_title = 'Sampling by U_K integration\n' + f'W2={w2:0.3f}'
+        fig, _ = draw_figure(energy_function, trajectory, fig_title)
+        fig.savefig(cfg.fig_filename)
+
+    elif cfg.energy_function == "DW4":
+        img = energy_function.get_dataset_fig(sample)
+        img.save(cfg.fig_filename)
+
+    elif cfg.energy_function == "LJ13":
+        img = energy_function.get_dataset_fig(sample)
+        img.save(cfg.fig_filename)
+
+
+def sample_trajectory(cfg, energy_function, noise_schedule):
+    device = cfg.device
+
+    x = sample_from_prior(cfg.sigma_max, dim=energy_function.dimensionality, device=device)
+    time = torch.linspace(cfg.start_time, cfg.end_time, cfg.num_steps + 1, device=device)
 
     vecfield = make_vector_field(
         energy_function=energy_function,
         noise_schedule=noise_schedule,
-        num_mc_samples=num_mc_samples,
+        num_mc_samples=cfg.num_mc_samples,
         device=device,
-        option=prob_path,
+        option=cfg.prob_path,
     )
 
-    trajectory = sample_trajectory_by_ode_integration(vecfield, x, time)
+    return sample_trajectory_by_ode_integration(vecfield, x, time)
+
+
+if __name__ == "__main__":
+    cfg = parse_args()
+
+    cfg.num_steps = 1000
+    cfg.end_time = 1.0
+    cfg.device = get_device()
+    cfg.fig_filename = get_filename(cfg)
+
+    wandb.init(
+        project="efm_vf_integrate",
+        config={
+            'energy_function': cfg.energy_function,
+            'num_mc_samples': cfg.num_mc_samples,
+            'ODE_integration_start_time': cfg.start_time,
+            'ODE_integration_steps': cfg.num_steps,
+            'probability_path': cfg.prob_path,
+            'sigma_max': cfg.sigma_max,
+            'sigma_min': cfg.sigma_min,
+            'sample_size': SAMPLE_SIZE,
+            'fig_file': cfg.fig_filename,
+        },
+        tags=[cfg.energy_function, cfg.prob_path]
+    )
+
+    noise_schedule = get_noise_schedule(cfg)
+    energy_function = get_energy_function(cfg)
+
+    trajectory = sample_trajectory(
+        cfg, 
+        energy_function, 
+        noise_schedule
+    )
     sample = trajectory[-1]
 
+    if FILTER_OUTLIER:
+        sample = filter_outlier(sample)
+
     w2 = wasserstein2(energy_function, sample)
-    print(f'\tw2 distance: {w2}')
+    wandb.log({'test/2-Wasserstein': w2})
 
-    if ENERGY_FUNCTION == "GMM":
-        fig_title = 'Sampling by U_K integration\n' + f'W2={w2:0.3f}'
-        fig, axs = draw_figure(energy_function, trajectory, fig_title)
+    draw_figure_and_save(cfg, energy_function, trajectory, w2)
 
-        filename = get_filename(
-            sigma_max, sigma_min, num_mc_samples, start_time, end_time, prob_path
-        )
-
-        fig.savefig(filename)
+    wandb.finish()

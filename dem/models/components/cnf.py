@@ -124,8 +124,8 @@ class CNF(torch.nn.Module):
 
     def integrate(self, x):
         method = self.method
-        end_time = int(self.is_diffusion)
-        start_time = 1.0 - end_time
+        start_time = self.start_time
+        end_time = self.end_time
 
         time = torch.linspace(start_time, end_time, self.num_steps + 1, device=x.device)
         try:
