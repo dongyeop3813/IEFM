@@ -1,5 +1,7 @@
 _target_: dem.models.efm_module.EFMLitModule
 
+prob_path: OT
+
 optimizer:
   _target_: torch.optim.Adam
   _partial_: true
