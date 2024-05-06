@@ -113,3 +113,20 @@ class VEcnfNoiseSchedule(BaseNoiseSchedule):
             self.sigma_max * ((self.sigma_diff) ** t)
         ) ** 2
 
+
+class RevGeometricNoiseSchedule(BaseNoiseSchedule):
+    def __init__(self, sigma_min, sigma_max=1.0):
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_diff = sigma_max / sigma_min
+
+    def g(self, t):
+        raise NotImplementedError
+
+    def h(self, t):
+        # Let sigma_d = sigma_max / sigma_min
+        # Then h(t) = \int_0^t g(z)^2 dz = sigma_min * sqrt{sigma_d^{2t} - 1}
+        # see Eq 199 in https://arxiv.org/pdf/2206.00364.pdf
+        return (
+            self.sigma_max * ((self.sigma_diff) ** (1-t))
+        ) ** 2

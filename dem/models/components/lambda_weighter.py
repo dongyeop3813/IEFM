@@ -23,3 +23,12 @@ class BasicLambdaWeighter(BaseLambdaWeighter):
 class NoLambdaWeighter(BasicLambdaWeighter):
     def __call__(self, t: torch.Tensor) -> torch.Tensor:
         return 1
+
+
+class InverseLambdaWeighter(BaseLambdaWeighter):
+    def __init__(self, noise_schedule: BaseNoiseSchedule, epsilon: float = 1e-3):
+        self.noise_schedule = noise_schedule
+        self.epsilon = epsilon
+
+    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+        return 1 / (self.noise_schedule.h(t) + self.epsilon)
