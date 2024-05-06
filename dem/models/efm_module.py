@@ -10,10 +10,7 @@ import torch
 from hydra.utils import get_original_cwd
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
-from torchcfm.conditional_flow_matching import (
-    ConditionalFlowMatcher,
-    ExactOptimalTransportConditionalFlowMatcher,
-)
+
 from torchmetrics import MeanMetric
 
 from dem.energies.base_energy_function import BaseEnergyFunction
@@ -29,9 +26,7 @@ from .components.noise_schedules import BaseNoiseSchedule
 from .components.prioritised_replay_buffer import PrioritisedReplayBuffer
 from .components.scaling_wrapper import ScalingWrapper
 from .components.vf_estimator import estimate_VF, estimate_VF_for_fixed_time
-from .components.score_estimator import estimate_grad_Rt, wrap_for_richardsons
 from .components.score_scaler import BaseScoreScaler
-from .components.sdes import VEReverseSDE
 
 
 def t_stratified_loss(batch_t, batch_loss, num_bins=5, loss_name=None):
@@ -115,25 +110,16 @@ class EFMLitModule(LightningModule):
         eval_batch_size: int,
         num_integration_steps: int,
         lr_scheduler_update_frequency: int,
-        nll_with_cfm: bool,
         nll_with_dem: bool,
         nll_on_buffer: bool,
-        logz_with_cfm: bool,
-        cfm_sigma: float,
-        cfm_prior_std: float,
-        use_otcfm: bool,
         nll_integration_method: str,
-        use_richardsons: bool,
         compile: bool,
-        prioritize_cfm_training_samples: bool = False,
         input_scaling_factor: Optional[float] = None,
         output_scaling_factor: Optional[float] = None,
         clipper: Optional[Clipper] = None,
         score_scaler: Optional[BaseScoreScaler] = None,
         partial_prior=None,
-        clipper_gen: Optional[Clipper] = None,
         diffusion_scale=1.0,
-        cfm_loss_weight=1.0,
         use_ema=False,
         use_exact_likelihood=False,
         debug_use_train_data=False,
@@ -142,9 +128,8 @@ class EFMLitModule(LightningModule):
         use_buffer=True,
         tol=1e-5,
         version=1,
-        negative_time=False,
-        num_negative_time_steps=100,
         prob_path='OT',
+        ode_start_time=0.00,
     ) -> None:
         """Initialize a `MNISTLitModule`.
 
@@ -162,24 +147,16 @@ class EFMLitModule(LightningModule):
         self.save_hyperparameters(logger=False)
 
         self.net = net(energy_function=energy_function)
-        self.cfm_net = net(energy_function=energy_function)
 
         if use_ema:
             self.net = EMAWrapper(self.net)
-            self.cfm_net = EMAWrapper(self.cfm_net)
         if input_scaling_factor is not None or output_scaling_factor is not None:
             self.net = ScalingWrapper(self.net, input_scaling_factor, output_scaling_factor)
-
-            self.cfm_net = ScalingWrapper(
-                self.cfm_net, input_scaling_factor, output_scaling_factor
-            )
 
         self.score_scaler = None
         if score_scaler is not None:
             self.score_scaler = self.hparams.score_scaler(noise_schedule)
-
             self.net = self.score_scaler.wrap_model_for_unscaling(self.net)
-            self.cfm_net = self.score_scaler.wrap_model_for_unscaling(self.cfm_net)
 
         self.efm_cnf = CNF(
             self.net,
@@ -189,32 +166,13 @@ class EFMLitModule(LightningModule):
             num_steps=num_integration_steps,
             atol=tol,
             rtol=tol,
-            start_time=0.01,
+            start_time=ode_start_time,
             end_time=1.0,
         )
-        self.cfm_cnf = CNF(
-            self.cfm_net,
-            is_diffusion=False,
-            use_exact_likelihood=use_exact_likelihood,
-            method=nll_integration_method,
-            num_steps=num_integration_steps,
-            atol=tol,
-            rtol=tol,
-        )
 
-        self.nll_with_cfm = nll_with_cfm
         self.nll_with_dem = nll_with_dem
         self.nll_on_buffer = nll_on_buffer
-        self.logz_with_cfm = logz_with_cfm
-        self.cfm_prior_std = cfm_prior_std
         self.compute_nll_on_train_data = compute_nll_on_train_data
-
-        flow_matcher = ConditionalFlowMatcher
-        if use_otcfm:
-            flow_matcher = ExactOptimalTransportConditionalFlowMatcher
-
-        self.cfm_sigma = cfm_sigma
-        self.conditional_flow_matcher = flow_matcher(sigma=cfm_sigma)
 
         self.nll_integration_method = nll_integration_method
 
@@ -222,18 +180,11 @@ class EFMLitModule(LightningModule):
         self.noise_schedule = noise_schedule
         self.buffer = buffer
         self.dim = self.energy_function.dimensionality
-
-        self.reverse_sde = VEReverseSDE(self.net, self.noise_schedule)
-
-        grad_fxn = estimate_grad_Rt
-        if use_richardsons:
-            grad_fxn = wrap_for_richardsons(grad_fxn)
+        self.ode_start_time = ode_start_time
 
         self.clipper = clipper
-        self.clipped_grad_fxn = self.clipper.wrap_grad_fxn(grad_fxn)
 
         self.dem_train_loss = MeanMetric()
-        self.cfm_train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.test_loss = MeanMetric()
 
@@ -292,7 +243,6 @@ class EFMLitModule(LightningModule):
         self.num_samples_to_save = num_samples_to_save
         self.eval_batch_size = eval_batch_size
 
-        self.prioritize_cfm_training_samples = prioritize_cfm_training_samples
         self.lambda_weighter = self.hparams.lambda_weighter(self.noise_schedule)
 
         self.last_samples = None
@@ -300,8 +250,6 @@ class EFMLitModule(LightningModule):
         self.eval_step_outputs = []
 
         self.partial_prior = partial_prior
-
-        self.clipper_gen = clipper_gen
 
         self.diffusion_scale = diffusion_scale
         self.init_from_prior = init_from_prior
@@ -316,29 +264,6 @@ class EFMLitModule(LightningModule):
         """
         return self.net(t, x)
 
-    def get_cfm_loss(self, samples: torch.Tensor) -> torch.Tensor:
-        x0 = self.cfm_prior.sample(self.num_samples_to_sample_from_buffer)
-        x1 = samples
-        x1 = self.energy_function.unnormalize(x1)
-
-        t, xt, ut = self.conditional_flow_matcher.sample_location_and_conditional_flow(x0, x1)
-
-        if self.energy_function.is_molecule and self.cfm_sigma != 0:
-            xt = remove_mean(
-                xt, self.energy_function.n_particles, self.energy_function.n_spatial_dim
-            )
-
-        vt = self.cfm_net(t, xt)
-        loss = (vt - ut).pow(2).mean(dim=-1)
-
-        # if self.energy_function.normalization_max is not None:
-        #    loss = loss / (self.energy_function.normalization_max ** 2)
-
-        return loss
-
-    def should_train_cfm(self, batch_idx: int) -> bool:
-        return self.nll_with_cfm or self.hparams.debug_use_train_data
-
     def get_loss(self, times: torch.Tensor, samples: torch.Tensor) -> torch.Tensor:
         estimated_VF = estimate_VF(
             times,
@@ -349,10 +274,6 @@ class EFMLitModule(LightningModule):
             device=self.device,
             option=self.prob_path,
         )
-
-        if estimated_VF.isnan().max():
-            print(estimated_VF)
-            raise Exception
 
         if self.clipper is not None and self.clipper.should_clip_scores:
             if self.energy_function.is_molecule:
@@ -378,9 +299,10 @@ class EFMLitModule(LightningModule):
 
     def sample_time(self, num_samples, device):
         """
-            Sample time points from uniform distribution on [0.01, 1].
+            Sample time points from uniform distribution on [s, e].
         """
-        t = 0.99 * torch.rand((num_samples,), device=device) + 0.01
+        s = self.ode_start_time
+        t = (1 - s) * torch.rand((num_samples,), device=device) + s
         return t
 
     def sample_noisy_data(self, times, origins):
@@ -427,15 +349,15 @@ class EFMLitModule(LightningModule):
                 origins=iter_samples,
             )
 
-            dem_loss = self.get_loss(times, noised_samples)
+            efm_loss = self.get_loss(times, noised_samples)
             self.log_dict(
-                t_stratified_loss(times, dem_loss, loss_name="train/stratified/dem_loss")
+                t_stratified_loss(times, efm_loss, loss_name="train/stratified/dem_loss")
             )
-            dem_loss = dem_loss.mean()
-            loss = loss + dem_loss
+            efm_loss = efm_loss.mean()
+            loss = loss + efm_loss
 
             # update and log metrics
-            self.dem_train_loss(dem_loss)
+            self.dem_train_loss(efm_loss)
             self.log(
                 "train/dem_loss",
                 self.dem_train_loss,
@@ -444,44 +366,12 @@ class EFMLitModule(LightningModule):
                 prog_bar=True,
             )
 
-        if self.should_train_cfm(batch_idx):
-            if self.hparams.debug_use_train_data:
-                cfm_samples = self.energy_function.sample_train_set(
-                    self.num_samples_to_sample_from_buffer
-                )
-                times = self.sample_time(
-                    num_samples=self.num_samples_to_sample_from_buffer,
-                    device=cfm_samples.device
-                )
-            else:
-                cfm_samples, _, _ = self.buffer.sample(
-                    self.num_samples_to_sample_from_buffer,
-                    prioritize=self.prioritize_cfm_training_samples,
-                )
-
-            cfm_loss = self.get_cfm_loss(cfm_samples)
-            self.log_dict(
-                t_stratified_loss(times, cfm_loss, loss_name="train/stratified/cfm_loss")
-            )
-            cfm_loss = cfm_loss.mean()
-            self.cfm_train_loss(cfm_loss)
-            self.log(
-                "train/cfm_loss",
-                self.cfm_train_loss,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=True,
-            )
-
-            loss = loss + self.hparams.cfm_loss_weight * cfm_loss
         return loss
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         optimizer.step(closure=optimizer_closure)
         if self.hparams.use_ema:
             self.net.update_ema()
-            if self.should_train_cfm(batch_idx):
-                self.cfm_net.update_ema()
 
     def generate_samples(
         self,
@@ -497,14 +387,14 @@ class EFMLitModule(LightningModule):
             return_full_trajectory=return_full_trajectory,
         )
 
+    @torch.no_grad()
     def integrate(
         self,
         samples: torch.Tensor = None,
         return_full_trajectory=False,
     ) -> torch.Tensor:
 
-        with torch.no_grad():
-            trajectory = self.efm_cnf.to(self.device).generate(samples).detach()
+        trajectory = self.efm_cnf.to(self.device).generate(samples).detach()
 
         if return_full_trajectory:
             return trajectory
@@ -749,32 +639,7 @@ class EFMLitModule(LightningModule):
                 self.efm_cnf, self.prior, batch, prefix, "dem_"
             )
             to_log["gen_1_dem"] = forwards_samples
-            self.compute_log_z(self.cfm_cnf, self.prior, sample, prefix, "dem_")
-        if self.nll_with_cfm:
-            forwards_samples = self.compute_and_log_nll(
-                self.cfm_cnf, self.cfm_prior, batch, prefix, ""
-            )
-            to_log["gen_1_cfm"] = forwards_samples
-
-            iter_samples, _, _ = self.buffer.sample(self.eval_batch_size)
-
-            # compute nll on buffer if not training cfm only
-            if not self.hparams.debug_use_train_data and self.nll_on_buffer:
-                forwards_samples = self.compute_and_log_nll(
-                    self.cfm_cnf, self.cfm_prior, iter_samples, prefix, "buffer_"
-                )
-
-            if self.compute_nll_on_train_data:
-                train_samples = self.energy_function.sample_train_set(self.eval_batch_size)
-                forwards_samples = self.compute_and_log_nll(
-                    self.cfm_cnf, self.cfm_prior, train_samples, prefix, "train_"
-                )
-
-        if self.logz_with_cfm:
-            sample = self.cfm_cnf.generate(
-                self.cfm_prior.sample(self.eval_batch_size),
-            )[-1]
-            self.compute_log_z(self.cfm_cnf, self.cfm_prior, sample, prefix, "")
+            self.compute_log_z(self.efm_cnf, self.prior, sample, prefix, "dem_")
 
         self.eval_step_outputs.append(to_log)
 
@@ -792,32 +657,11 @@ class EFMLitModule(LightningModule):
             for k in self.eval_step_outputs[0]
         }
 
-        unprioritized_buffer_samples, cfm_samples = None, None
-        if self.nll_with_cfm:
-            unprioritized_buffer_samples, _, _ = self.buffer.sample(
-                self.eval_batch_size,
-                prioritize=self.prioritize_cfm_training_samples,
-            )
-
-            cfm_samples = self.cfm_cnf.generate(
-                self.cfm_prior.sample(self.eval_batch_size),
-            )[-1]
-
-            self.energy_function.log_on_epoch_end(
-                self.last_samples,
-                self.last_energies,
-                wandb_logger,
-                unprioritized_buffer_samples=unprioritized_buffer_samples,
-                cfm_samples=cfm_samples,
-                replay_buffer=self.buffer,
-            )
-
-        else:
-            self.energy_function.log_on_epoch_end(
-                self.last_samples,
-                self.last_energies,
-                wandb_logger,
-            )
+        self.energy_function.log_on_epoch_end(
+            self.last_samples,
+            self.last_energies,
+            wandb_logger,
+        )
 
         if "data_0" in outputs:
             # pad with time dimension 1
@@ -897,10 +741,6 @@ class EFMLitModule(LightningModule):
 
         if self.hparams.compile and stage == "fit":
             self.net = torch.compile(self.net)
-            self.cfm_net = torch.compile(self.cfm_net)
-
-        if self.nll_with_cfm:
-            self.cfm_prior = self.partial_prior(device=self.device, scale=self.cfm_prior_std)
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
