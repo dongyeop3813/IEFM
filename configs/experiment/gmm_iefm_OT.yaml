@@ -9,7 +9,7 @@ defaults:
   - override /energy: gmm
   - override /model: efm
 
-tags: ["GMM", "iEFM"]
+tags: ["GMM", "iEFM", "OT"]
 
 seed: 12345
 
@@ -19,10 +19,8 @@ logger:
     group: "gmm_iefm"
 
 model:
-  nll_with_cfm: true
-
-  buffer:
-    prioritize: false
+  prob_path: OT
+  ode_start_time: 0.01
 
   noise_schedule:
     sigma_min: 0.00001
@@ -39,6 +37,9 @@ model:
     should_clip_log_rewards: False
     max_score_norm: 70
     min_log_reward: null
+
+  buffer:
+    prioritize: false
 
   lambda_weighter:
     _target_: dem.models.components.lambda_weighter.NoLambdaWeighter

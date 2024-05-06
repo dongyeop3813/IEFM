@@ -4,6 +4,9 @@ src.egg-info
 .env
 dem_results
 figure
+VF_integration
+VFplot
+wandb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

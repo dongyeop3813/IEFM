@@ -6,14 +6,14 @@
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-tags: ["DW4", "iEFM"]
+tags: ["DW4", "iEFM", "OT"]
 
 seed: 12345
 
 logger:
   wandb:
     tags: ${tags}
-    group: "dw4_efm"
+    group: "dw4_efm_OT"
 
 defaults:
   - override /energy: dw4
@@ -24,17 +24,18 @@ optimizer:
   lr: 1e-3
 
 model:
+  prob_path: OT
+  ode_start_time: 0.01
+
   net:
     n_particles: 4
     n_layers: 3
     hidden_nf: 128
     n_dimension: 2
 
-  nll_with_cfm: true
-
   noise_schedule:
     sigma_min: 0.00001
-    sigma_max: 3
+    sigma_max: 0.03
 
   partial_prior:
     _target_: dem.energies.base_prior.MeanFreePrior
@@ -50,7 +51,7 @@ model:
     _target_: dem.models.components.clipper.Clipper
     should_clip_scores: False
     should_clip_log_rewards: False
-    max_score_norm: 20
+    max_score_norm: 10
     min_log_reward: null
 
   diffusion_scale: 1
@@ -63,4 +64,3 @@ model:
   num_estimator_mc_samples: 1000
 
   nll_integration_method: dopri5
-  cfm_prior_std: 2.

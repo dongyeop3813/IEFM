@@ -17,15 +17,18 @@ seed: 12345
 logger:
   wandb:
     tags: ${tags}
-    group: "gmm_debug"
+    group: "gmm_iefm"
 
 model:
   prob_path: VE
-
-  nll_with_cfm: true
+  ode_start_time: 0.00
 
   buffer:
     prioritize: false
+
+  noise_schedule:
+    sigma_min: 0.00001
+    sigma_max: 1.0
 
   partial_prior:
     _target_: dem.energies.base_prior.Prior
