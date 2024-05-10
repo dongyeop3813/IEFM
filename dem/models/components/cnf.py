@@ -122,6 +122,7 @@ class CNF(torch.nn.Module):
         # print(div.mean())
         return torch.cat([dx.detach(), div[:, None].detach()], dim=-1)
 
+    @torch.no_grad()
     def integrate(self, x):
         method = self.method
         start_time = self.end_time
