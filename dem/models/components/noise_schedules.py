@@ -102,6 +102,7 @@ class VEcnfNoiseSchedule(BaseNoiseSchedule):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_diff = sigma_min / sigma_max
+        self.c = torch.log(torch.tensor(self.sigma_diff))
 
     def g(self, t):
         raise NotImplementedError

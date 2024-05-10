@@ -28,7 +28,7 @@ def VE_conditional_VF(
 
     :return: Evaluted (conditional) vector field (K x D dimension)
     """
-    c = torch.log(torch.tensor(noise_schedule.sigma_diff).to(perturbed))
+    c = noise_schedule.c.to(perturbed)
     return c * (perturbed - endpoint)
 
 
@@ -122,7 +122,10 @@ def _VF_estimator(
     cvf = conditional_VF(x, endpoint_candidates, t, noise_schedule)
 
     if DEBUG:
-        print(endpoint_candidates)
+        print((weights != 0))
+
+        print(weights)
+
         print(f"endpoint has nan {endpoint_candidates.isnan().max()}")
         print(f"weights has nan {weights.isnan().max()}")
         print(f"cvf has nan {cvf.isnan().max()}")
