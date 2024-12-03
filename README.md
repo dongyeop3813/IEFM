@@ -5,7 +5,7 @@
 [![Preprint](http://img.shields.io/badge/paper-arxiv.2402.06121-B31B1B.svg)](https://arxiv.org/abs/2408.16249)
 </div>
 
-Our code is inspired by [iterated denoising energy matching](https://github.com/jarridrb/DEM)
+Our code is inspired by [iterated denoising energy matching](https://github.com/jarridrb/DEM).
 
 ## Installation
 
