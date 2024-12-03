@@ -5,7 +5,9 @@
 [![Preprint](http://img.shields.io/badge/paper-arxiv.2402.06121-B31B1B.svg)](https://arxiv.org/abs/2408.16249)
 </div>
 
-This repository is built based on [iDEM](https://github.com/jarridrb/DEM)
+In this repository, we implement the paper: Iterated energy-based flow matching for sampling from Boltzmann densities.
+
+Our code is inspired by [iterated denoising energy matching](https://github.com/jarridrb/DEM).
 
 ## Installation
 
@@ -13,10 +15,6 @@ For installation, we recommend the use of Micromamba. Please refer [here](https:
 First, we install dependencies
 
 ```bash
-# clone project
-git clone git@github.com:jarridrb/DEM.git
-cd DEM
-
 # create micromamba environment
 micromamba create -f environment.yaml
 micromamba activate dem
@@ -25,6 +23,8 @@ micromamba activate dem
 pip install -r requirements.txt
 
 ```
+
+If above installation commands do not work, use `environment.lock` to create the environment.
 
 Note that the hydra configs interpolate using some environment variables set in the file `.env`. We provide
 an example `.env.example` file for convenience. Note that to use wandb we require that you set WANDB_ENTITY in your
