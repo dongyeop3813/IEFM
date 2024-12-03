@@ -67,8 +67,8 @@ class CNF(torch.nn.Module):
         rtol=1e-5,
         max_steps_till_fallback=3000,
         num_steps=100,
-        start_time=0.0,
-        end_time=1.0,
+        time_at_prior=0.0,
+        time_at_data=1.0,
     ):
         super().__init__()
 
@@ -86,11 +86,11 @@ class CNF(torch.nn.Module):
             self.num_steps = 1
 
         if self.is_diffusion:
-            self.start_time = 1.0
-            self.end_time = 0.0
+            self.time_at_prior = 1.0
+            self.time_at_data = 0.0
         else:
-            self.start_time = start_time
-            self.end_time = end_time
+            self.time_at_prior = time_at_prior
+            self.time_at_data = time_at_data
 
     def forward(self, t, x):
         if self.nfe > self.max_steps_till_fallback:
@@ -125,10 +125,10 @@ class CNF(torch.nn.Module):
     @torch.no_grad()
     def integrate(self, x):
         method = self.method
-        start_time = self.end_time
-        end_time = self.start_time
+        time_at_prior = self.time_at_prior
+        time_at_data = self.time_at_data
 
-        time = torch.linspace(start_time, end_time, self.num_steps + 1, device=x.device)
+        time = torch.linspace(time_at_data, time_at_prior, self.num_steps + 1, device=x.device)
         try:
             return odeint(self, x, t=time, method=method, atol=self.atol, rtol=self.rtol)
 
@@ -137,12 +137,14 @@ class CNF(torch.nn.Module):
             print("Falling back on fixed-step integration")
             self.nfe = 0.0
             time = torch.linspace(
-                start_time, end_time, self.max_steps_till_fallback + 1, device=x.device
+                time_at_data, time_at_prior, self.max_steps_till_fallback + 1, device=x.device
             )
             return odeint(self, x, t=time, method="euler")
 
     def generate(self, x):
         method = self.method
+        time_at_data = self.time_at_data
+        time_at_prior = self.time_at_prior
 
         def reverse_wrapper(model):
             def fxn(t, x, args=None):
@@ -153,10 +155,7 @@ class CNF(torch.nn.Module):
 
             return fxn
 
-        start_time = self.start_time
-        end_time = self.end_time
-
-        time = torch.linspace(start_time, end_time, self.num_steps + 1, device=x.device)
+        time = torch.linspace(time_at_prior, time_at_data, self.num_steps + 1, device=x.device)
 
         try:
             return odeint(
@@ -173,6 +172,6 @@ class CNF(torch.nn.Module):
             print("Falling back on fixed-step integration")
             self.nfe = 0.0
             time = torch.linspace(
-                start_time, end_time, self.max_steps_till_fallback + 1, device=x.device
+                time_at_prior, time_at_data, self.max_steps_till_fallback + 1, device=x.device
             )
             return odeint(reverse_wrapper(self.vf), x, t=time, method="euler")

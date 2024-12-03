@@ -4,9 +4,12 @@ import torch
 from dem.energies.base_energy_function import BaseEnergyFunction
 from dem.models.components.clipper import Clipper
 from dem.models.components.noise_schedules import BaseNoiseSchedule
+from dem.models.components.score_estimator import estimate_grad_Rt
 
 
 DEBUG = False
+EPSILON = 1e-23
+USE_SOFTMAX_TRICK = False
 
 
 def VE_conditional_VF(
@@ -28,8 +31,7 @@ def VE_conditional_VF(
 
     :return: Evaluted (conditional) vector field (K x D dimension)
     """
-    c = noise_schedule.c.to(perturbed)
-    return c * (perturbed - endpoint)
+    return noise_schedule.c * (perturbed - endpoint)
 
 
 def OT_conditional_VF(
@@ -53,20 +55,20 @@ def OT_conditional_VF(
     """
 
     coeff = 1 - noise_schedule.sigma_diff
-    return (endpoint - coeff * perturbed) / (1 - coeff * time + 1e-23)
+    return (endpoint - coeff * perturbed) / (1 - coeff * time + EPSILON)
 
 
 def sampling_from_OT_importance(t, x, sigma_t, device):
     return (
-        (x + (torch.randn_like(x, device=device) * sigma_t.sqrt())) 
+        (x + (torch.randn_like(x, device=device) * sigma_t)) 
         /
-        (t.unsqueeze(1) + 1e-23)
+        (t.unsqueeze(1) + EPSILON)
     )
 
 
 def sampling_from_VE_importance(t, x, sigma_t, device):
     return (
-        x + torch.randn_like(x, device=device) * sigma_t.sqrt()
+        x + torch.randn_like(x, device=device) * sigma_t
     )
 
 
@@ -103,18 +105,21 @@ def _VF_estimator(
     repeated_t = t.unsqueeze(0).repeat_interleave(num_mc_samples, dim=0)
     repeated_x = x.unsqueeze(0).repeat_interleave(num_mc_samples, dim=0)
 
-    h_t = noise_schedule.h(repeated_t).unsqueeze(1)
+    sigma_t = noise_schedule.sigma(repeated_t).unsqueeze(1)
 
     # sample from importance distribution q(-;x) (K x D dimension)
     endpoint_candidates = sample_from_importance_dist(
         repeated_t,
         repeated_x,
-        h_t,
+        sigma_t,
         device=device,
     )
 
     # log (unnormalized) prob of each sample (dimension K)
     log_prob = energy_function(endpoint_candidates)
+
+    if USE_SOFTMAX_TRICK:
+        log_prob = log_prob - log_prob.max()
 
     # weights (dimension K)
     weights = torch.softmax(log_prob, dim=0)
@@ -150,18 +155,29 @@ def estimate_VF(
     """
         Estimate marginal vector field with batched time, x input.
     """
+    if option == 'OT' or option == 'VE':
+        # vectorizing map for batch processing
+        vmmaped_fxn = torch.vmap(
+            _VF_estimator, 
+            in_dims=(0, 0, None, None, None, None), 
+            randomness="different"
+        )
 
-    # vectorizing map for batch processing
-    vmmaped_fxn = torch.vmap(
-        _VF_estimator, 
-        in_dims=(0, 0, None, None, None, None), 
-        randomness="different"
-    )
+        return vmmaped_fxn(
+            t, x, energy_function, noise_schedule, num_mc_samples, 
+            option, device=device
+        )
 
-    return vmmaped_fxn(
-        t, x, energy_function, noise_schedule, num_mc_samples, 
-        option, device=device
-    )
+    elif option == 'PFODE':
+        sigma_t = noise_schedule.sigma(t).unsqueeze(1)
+        sigma_t_prime = noise_schedule.sigma_prime(t).unsqueeze(1)
+
+        weight = -sigma_t * sigma_t_prime
+        scores = estimate_grad_Rt(
+            t, x, energy_function, noise_schedule, num_mc_samples
+        )
+
+        return weight * scores
 
 
 def estimate_VF_for_fixed_time(
@@ -177,13 +193,27 @@ def estimate_VF_for_fixed_time(
         Estimate marginal vector field with batched x and single time input.
     """
 
-    vmmaped_fxn = torch.vmap(
-        _VF_estimator,
-        in_dims=(None, 0, None, None, None, None),
-        randomness="different"
-    )
+    if option == 'VE' or option == 'OT':
+        vmmaped_fxn = torch.vmap(
+            _VF_estimator,
+            in_dims=(None, 0, None, None, None, None),
+            randomness="different"
+        )
 
-    return vmmaped_fxn(
-        t, x, energy_function, noise_schedule, num_mc_samples,
-        option, device=device
-    )
+        return vmmaped_fxn(
+            t, x, energy_function, noise_schedule, num_mc_samples,
+            option, device=device
+        )
+
+    elif option == 'PFODE':
+        t = t.repeat_interleave(x.size(0))
+
+        sigma_t = noise_schedule.sigma(t).unsqueeze(1)
+        sigma_t_prime = noise_schedule.sigma_prime(t).unsqueeze(1)
+
+        weight = -sigma_t * sigma_t_prime
+        scores = estimate_grad_Rt(
+            t, x, energy_function, noise_schedule, num_mc_samples
+        )
+
+        return weight * scores

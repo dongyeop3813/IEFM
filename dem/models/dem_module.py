@@ -728,9 +728,9 @@ class DEMLitModule(LightningModule):
         }
 
         if self.nll_with_dem:
-            batch = self.energy_function.normalize(batch)
+            normalized_batch = self.energy_function.normalize(batch)
             forwards_samples = self.compute_and_log_nll(
-                self.dem_cnf, self.prior, batch, prefix, "dem_"
+                self.dem_cnf, self.prior, normalized_batch, prefix, "dem_"
             )
             to_log["gen_1_dem"] = forwards_samples
             self.compute_log_z(self.cfm_cnf, self.prior, backwards_samples, prefix, "dem_")

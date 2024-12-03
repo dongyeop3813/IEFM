@@ -10,6 +10,10 @@ import torch
 from hydra.utils import get_original_cwd
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
+from torchcfm.conditional_flow_matching import (
+    ConditionalFlowMatcher,
+    ExactOptimalTransportConditionalFlowMatcher,
+)
 
 from torchmetrics import MeanMetric
 
@@ -25,7 +29,7 @@ from .components.lambda_weighter import BaseLambdaWeighter
 from .components.noise_schedules import BaseNoiseSchedule
 from .components.prioritised_replay_buffer import PrioritisedReplayBuffer
 from .components.scaling_wrapper import ScalingWrapper
-from .components.vf_estimator import estimate_VF, estimate_VF_for_fixed_time
+from .components.vf_estimator import estimate_VF
 from .components.score_scaler import BaseScoreScaler
 
 
@@ -110,16 +114,23 @@ class EFMLitModule(LightningModule):
         eval_batch_size: int,
         num_integration_steps: int,
         lr_scheduler_update_frequency: int,
+        nll_with_cfm: bool,
         nll_with_dem: bool,
         nll_on_buffer: bool,
+        logz_with_cfm: bool,
+        cfm_sigma: float,
+        cfm_prior_std: float,
+        use_otcfm: bool,
         nll_integration_method: str,
         compile: bool,
+        prioritize_cfm_training_samples: bool = False,
         input_scaling_factor: Optional[float] = None,
         output_scaling_factor: Optional[float] = None,
         clipper: Optional[Clipper] = None,
         score_scaler: Optional[BaseScoreScaler] = None,
         partial_prior=None,
         diffusion_scale=1.0,
+        cfm_loss_weight=1.0,
         use_ema=False,
         use_exact_likelihood=False,
         debug_use_train_data=False,
@@ -128,10 +139,10 @@ class EFMLitModule(LightningModule):
         use_buffer=True,
         tol=1e-5,
         version=1,
-        prob_path='OT',
+        prob_path="OT",
         ode_start_time=0.00,
     ) -> None:
-        """Initialize a `MNISTLitModule`.
+        """Initialize a `EFMLitModule`.
 
         :param net: The model to train.
         :param optimizer: The optimizer to use for training.
@@ -147,16 +158,7 @@ class EFMLitModule(LightningModule):
         self.save_hyperparameters(logger=False)
 
         self.net = net(energy_function=energy_function)
-
-        if use_ema:
-            self.net = EMAWrapper(self.net)
-        if input_scaling_factor is not None or output_scaling_factor is not None:
-            self.net = ScalingWrapper(self.net, input_scaling_factor, output_scaling_factor)
-
-        self.score_scaler = None
-        if score_scaler is not None:
-            self.score_scaler = self.hparams.score_scaler(noise_schedule)
-            self.net = self.score_scaler.wrap_model_for_unscaling(self.net)
+        self.cfm_net = net(energy_function=energy_function)
 
         self.efm_cnf = CNF(
             self.net,
@@ -166,15 +168,21 @@ class EFMLitModule(LightningModule):
             num_steps=num_integration_steps,
             atol=tol,
             rtol=tol,
-            start_time=ode_start_time,
-            end_time=1.0,
+            time_at_prior=ode_start_time,
+            time_at_data=1.0,
         )
 
-        self.nll_with_dem = nll_with_dem
-        self.nll_on_buffer = nll_on_buffer
-        self.compute_nll_on_train_data = compute_nll_on_train_data
+        self.cfm_cnf = CNF(
+            self.cfm_net,
+            is_diffusion=False,
+            use_exact_likelihood=use_exact_likelihood,
+            method=nll_integration_method,
+            num_steps=num_integration_steps,
+            atol=tol,
+            rtol=tol,
+        )
 
-        self.nll_integration_method = nll_integration_method
+        self.prob_path = prob_path
 
         self.energy_function = energy_function
         self.noise_schedule = noise_schedule
@@ -184,77 +192,112 @@ class EFMLitModule(LightningModule):
 
         self.clipper = clipper
 
-        self.dem_train_loss = MeanMetric()
-        self.val_loss = MeanMetric()
-        self.test_loss = MeanMetric()
-
-        self.val_nll_logdetjac = MeanMetric()
-        self.test_nll_logdetjac = MeanMetric()
-        self.val_nll_log_p_1 = MeanMetric()
-        self.test_nll_log_p_1 = MeanMetric()
-        self.val_nll = MeanMetric()
-        self.test_nll = MeanMetric()
-        self.val_nfe = MeanMetric()
-        self.test_nfe = MeanMetric()
-        self.val_energy_w2 = MeanMetric()
-        self.val_dist_w2 = MeanMetric()
-        self.val_dist_total_var = MeanMetric()
-
-        self.val_dem_nll_logdetjac = MeanMetric()
-        self.test_dem_nll_logdetjac = MeanMetric()
-        self.val_dem_nll_log_p_1 = MeanMetric()
-        self.test_dem_nll_log_p_1 = MeanMetric()
-        self.val_dem_nll = MeanMetric()
-        self.test_dem_nll = MeanMetric()
-        self.val_dem_nfe = MeanMetric()
-        self.test_dem_nfe = MeanMetric()
-        self.val_dem_logz = MeanMetric()
-        self.val_logz = MeanMetric()
-        self.test_dem_logz = MeanMetric()
-        self.test_logz = MeanMetric()
-
-        self.val_buffer_nll_logdetjac = MeanMetric()
-        self.val_buffer_nll_log_p_1 = MeanMetric()
-        self.val_buffer_nll = MeanMetric()
-        self.val_buffer_nfe = MeanMetric()
-        self.val_buffer_logz = MeanMetric()
-        self.test_buffer_nll_logdetjac = MeanMetric()
-        self.test_buffer_nll_log_p_1 = MeanMetric()
-        self.test_buffer_nll = MeanMetric()
-        self.test_buffer_nfe = MeanMetric()
-        self.test_buffer_logz = MeanMetric()
-
-        self.val_train_nll_logdetjac = MeanMetric()
-        self.val_train_nll_log_p_1 = MeanMetric()
-        self.val_train_nll = MeanMetric()
-        self.val_train_nfe = MeanMetric()
-        self.val_train_logz = MeanMetric()
-        self.test_train_nll_logdetjac = MeanMetric()
-        self.test_train_nll_log_p_1 = MeanMetric()
-        self.test_train_nll = MeanMetric()
-        self.test_train_nfe = MeanMetric()
-        self.test_train_logz = MeanMetric()
-
         self.num_init_samples = num_init_samples
         self.num_estimator_mc_samples = num_estimator_mc_samples
         self.num_samples_to_generate_per_epoch = num_samples_to_generate_per_epoch
         self.num_samples_to_sample_from_buffer = num_samples_to_sample_from_buffer
         self.num_integration_steps = num_integration_steps
         self.num_samples_to_save = num_samples_to_save
-        self.eval_batch_size = eval_batch_size
 
         self.lambda_weighter = self.hparams.lambda_weighter(self.noise_schedule)
 
+        self.partial_prior = partial_prior
+        self.init_from_prior = init_from_prior
+
+        # Evaluation option
+        self.eval_batch_size = eval_batch_size
+
+        self.should_eval_nll_with_cfm = nll_with_cfm
+        self.should_eval_logz_with_cfm = logz_with_cfm
+
+        self.should_eval_nll_with_efm = nll_with_dem
+
+        self.should_eval_nll_on_buffer = nll_on_buffer
+        self.should_compute_nll_on_train_data = compute_nll_on_train_data
+
+        # If we should train cfm, set hyperparameters of cfm.
+        self.should_train_cfm = (
+            self.should_eval_nll_with_cfm or self.hparams.debug_use_train_data
+        )
+        if self.should_train_cfm:
+            self.cfm_prior_std = cfm_prior_std
+            flow_matcher = ConditionalFlowMatcher
+            if use_otcfm:
+                flow_matcher = ExactOptimalTransportConditionalFlowMatcher
+
+            self.cfm_sigma = cfm_sigma
+            self.conditional_flow_matcher = flow_matcher(sigma=cfm_sigma)
+
+            self.prioritize_cfm_training_samples = prioritize_cfm_training_samples
+
+        # Loss metric
+        self.dem_train_loss = MeanMetric()
+        self.cfm_train_loss = MeanMetric()
+        self.val_loss = MeanMetric()
+        self.test_loss = MeanMetric()
+
+        # Validation metric with cfm_net
+        self.val_nll_logdetjac = MeanMetric()
+        self.val_nll_log_p_1 = MeanMetric()
+        self.val_nll = MeanMetric()
+        self.val_nfe = MeanMetric()
+        self.val_energy_w2 = MeanMetric()
+        self.val_dist_w2 = MeanMetric()
+        self.val_dist_total_var = MeanMetric()
+
+        # Validation metric with efm_net
+        self.val_dem_nll_logdetjac = MeanMetric()
+        self.val_dem_nll_log_p_1 = MeanMetric()
+        self.val_dem_nll = MeanMetric()
+        self.val_dem_nfe = MeanMetric()
+        self.val_dem_logz = MeanMetric()
+
+        self.val_logz = MeanMetric()
+
+        # Metric on buffer
+        self.val_buffer_nll_logdetjac = MeanMetric()
+        self.val_buffer_nll_log_p_1 = MeanMetric()
+        self.val_buffer_nll = MeanMetric()
+        self.val_buffer_nfe = MeanMetric()
+        self.val_buffer_logz = MeanMetric()
+
+        self.val_train_nll_logdetjac = MeanMetric()
+        self.val_train_nll_log_p_1 = MeanMetric()
+        self.val_train_nll = MeanMetric()
+        self.val_train_nfe = MeanMetric()
+        self.val_train_logz = MeanMetric()
+
+        # Test metric with cfm_net
+        self.test_nll_logdetjac = MeanMetric()
+        self.test_nll_log_p_1 = MeanMetric()
+        self.test_nll = MeanMetric()
+        self.test_nfe = MeanMetric()
+
+        # Test metric with efm_net
+        self.test_dem_nll_logdetjac = MeanMetric()
+        self.test_dem_nll_log_p_1 = MeanMetric()
+        self.test_dem_nll = MeanMetric()
+        self.test_dem_nfe = MeanMetric()
+        self.test_dem_logz = MeanMetric()
+        self.test_logz = MeanMetric()
+
+        # Metric on buffer
+        self.test_buffer_nll_logdetjac = MeanMetric()
+        self.test_buffer_nll_log_p_1 = MeanMetric()
+        self.test_buffer_nll = MeanMetric()
+        self.test_buffer_nfe = MeanMetric()
+        self.test_buffer_logz = MeanMetric()
+
+        self.test_train_nll_logdetjac = MeanMetric()
+        self.test_train_nll_log_p_1 = MeanMetric()
+        self.test_train_nll = MeanMetric()
+        self.test_train_nfe = MeanMetric()
+        self.test_train_logz = MeanMetric()
+
+        # Initialize temp variables
         self.last_samples = None
         self.last_energies = None
         self.eval_step_outputs = []
-
-        self.partial_prior = partial_prior
-
-        self.diffusion_scale = diffusion_scale
-        self.init_from_prior = init_from_prior
-
-        self.prob_path = prob_path
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
@@ -264,7 +307,28 @@ class EFMLitModule(LightningModule):
         """
         return self.net(t, x)
 
-    def get_loss(self, times: torch.Tensor, samples: torch.Tensor) -> torch.Tensor:
+    def get_cfm_loss(self, samples: torch.Tensor) -> torch.Tensor:
+        x0 = self.cfm_prior.sample(self.num_samples_to_sample_from_buffer)
+        x1 = samples
+        x1 = self.energy_function.unnormalize(x1)
+
+        t, xt, ut = self.conditional_flow_matcher.sample_location_and_conditional_flow(
+            x0, x1
+        )
+
+        if self.energy_function.is_molecule and self.cfm_sigma != 0:
+            xt = remove_mean(
+                xt, self.energy_function.n_particles, self.energy_function.n_spatial_dim
+            )
+
+        vt = self.cfm_net(t, xt)
+        loss = (vt - ut).pow(2).mean(dim=-1)
+
+        return loss
+
+    def get_pointwise_loss(
+        self, times: torch.Tensor, samples: torch.Tensor
+    ) -> torch.Tensor:
         estimated_VF = estimate_VF(
             times,
             samples,
@@ -286,10 +350,9 @@ class EFMLitModule(LightningModule):
             estimated_VF = self.clipper.clip_scores(estimated_VF)
 
             if self.energy_function.is_molecule:
-                estimated_VF = estimated_VF.reshape(-1, self.energy_function.dimensionality)
-
-        if self.score_scaler is not None:
-            estimated_VF = self.score_scaler.scale_target_score(estimated_VF, times)
+                estimated_VF = estimated_VF.reshape(
+                    -1, self.energy_function.dimensionality
+                )
 
         predicted_VF = self.forward(times, samples)
 
@@ -297,30 +360,32 @@ class EFMLitModule(LightningModule):
 
         return self.lambda_weighter(times) * error_norms
 
-    def sample_time(self, num_samples, device):
+    def sample_time(self, num_samples):
         """
-            Sample time points from uniform distribution on [s, e].
+        Sample time points from uniform distribution on [s, e].
         """
         s = self.ode_start_time
-        t = (1 - s) * torch.rand((num_samples,), device=device) + s
+        t = (1 - s) * torch.rand((num_samples,), device=self.device) + s
         return t
 
-    def sample_noisy_data(self, times, origins):
+    def add_noise_to(self, origins, times):
         """
-            Sample perturbed data at time t for given origin data points.
-            Here, times and origins are batch.
+        Perturb given data points with conditional t|1.
+        Here, times and origins are batch.
         """
 
         sigma_t = self.noise_schedule.h(times).sqrt().unsqueeze(-1)
 
-        if self.prob_path == 'OT':
+        if self.prob_path == "OT":
             noisy_data = times.unsqueeze(1) * origins + (
                 torch.randn_like(origins) * sigma_t
             )
-        elif self.prob_path == 'VE':
-            noisy_data = origins + (
-                torch.randn_like(origins) * sigma_t
-            )
+        elif self.prob_path == "VE":
+            noisy_data = origins + (torch.randn_like(origins) * sigma_t)
+        elif self.prob_path == "PFODE":
+            noisy_data = origins + (torch.randn_like(origins) * sigma_t)
+        else:
+            raise Exception("Invalid probability path")
 
         if self.energy_function.is_molecule:
             noisy_data = remove_mean(
@@ -331,28 +396,42 @@ class EFMLitModule(LightningModule):
 
         return noisy_data
 
+    def get_EFM_loss(
+        self,
+        sample_from_target: torch.Tensor,
+    ) -> torch.Tensor:
+
+        num_samples = sample_from_target.size(0)
+
+        times = self.sample_time(num_samples=num_samples)
+
+        perturbed_samples = self.add_noise_to(
+            sample_from_target,
+            times=times,
+        )
+
+        loss = self.get_pointwise_loss(times, perturbed_samples)
+
+        return loss, times, perturbed_samples
+
     def training_step(self, batch, batch_idx):
         loss = 0.0
         if not self.hparams.debug_use_train_data:
             if self.hparams.use_buffer:
-                iter_samples, _, _ = self.buffer.sample(self.num_samples_to_sample_from_buffer)
+                iter_samples, _, _ = self.buffer.sample(
+                    self.num_samples_to_sample_from_buffer
+                )
             else:
                 iter_samples = self.prior.sample(self.num_samples_to_sample_from_buffer)
 
-            times = self.sample_time(
-                num_samples=self.num_samples_to_sample_from_buffer, 
-                device=iter_samples.device
-            )
+            efm_loss, times, _ = self.get_EFM_loss(iter_samples)
 
-            noised_samples = self.sample_noisy_data(
-                times=times,
-                origins=iter_samples,
-            )
-
-            efm_loss = self.get_loss(times, noised_samples)
             self.log_dict(
-                t_stratified_loss(times, efm_loss, loss_name="train/stratified/dem_loss")
+                t_stratified_loss(
+                    times, efm_loss, loss_name="train/stratified/dem_loss"
+                )
             )
+
             efm_loss = efm_loss.mean()
             loss = loss + efm_loss
 
@@ -366,12 +445,41 @@ class EFMLitModule(LightningModule):
                 prog_bar=True,
             )
 
+        if self.should_train_cfm:
+            if self.hparams.debug_use_train_data:
+                cfm_samples = self.energy_function.sample_train_set(
+                    self.num_samples_to_sample_from_buffer
+                )
+                times = torch.rand(
+                    (self.num_samples_to_sample_from_buffer,), device=cfm_samples.device
+                )
+            else:
+                cfm_samples, _, _ = self.buffer.sample(
+                    self.num_samples_to_sample_from_buffer,
+                    prioritize=self.prioritize_cfm_training_samples,
+                )
+
+            cfm_loss = self.get_cfm_loss(cfm_samples)
+            self.log_dict(
+                t_stratified_loss(
+                    times, cfm_loss, loss_name="train/stratified/cfm_loss"
+                )
+            )
+            cfm_loss = cfm_loss.mean()
+            self.cfm_train_loss(cfm_loss)
+            self.log(
+                "train/cfm_loss",
+                self.cfm_train_loss,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+            )
+
+            loss = loss + self.hparams.cfm_loss_weight * cfm_loss
         return loss
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         optimizer.step(closure=optimizer_closure)
-        if self.hparams.use_ema:
-            self.net.update_ema()
 
     def generate_samples(
         self,
@@ -380,10 +488,10 @@ class EFMLitModule(LightningModule):
     ) -> torch.Tensor:
         num_samples = num_samples or self.num_samples_to_generate_per_epoch
 
-        sample_from_X0 = self.prior.sample(num_samples)
+        noise = self.prior.sample(num_samples)
 
         return self.integrate(
-            samples=sample_from_X0,
+            samples=noise,
             return_full_trajectory=return_full_trajectory,
         )
 
@@ -401,6 +509,22 @@ class EFMLitModule(LightningModule):
 
         return trajectory[-1]
 
+    def on_train_epoch_end(self) -> None:
+        "Lightning hook that is called when a training epoch ends."
+
+        self.last_samples = self.generate_samples()
+        self.last_energies = self.energy_function(self.last_samples)
+
+        # Insert sample into the buffer
+        self.buffer.add(self.last_samples, self.last_energies)
+
+        # Compute and log energy_w2, dist_w2 and total_var.
+        self.compute_and_log_energy_w2(stage="val")
+
+        if self.energy_function.is_molecule:
+            self.compute_and_log_dist_w2(stage="val")
+            self.compute_and_log_dist_total_var(stage="val")
+
     def compute_nll(
         self,
         cnf,
@@ -411,102 +535,106 @@ class EFMLitModule(LightningModule):
             [samples, torch.zeros(samples.shape[0], 1, device=samples.device)], dim=-1
         )
         aug_output = cnf.integrate(aug_samples).detach()[-1]
-        x_1, logdetjac = aug_output[..., :-1], aug_output[..., -1]
-        log_p_1 = prior.log_prob(x_1)
-        log_p_0 = log_p_1 + logdetjac
-        nll = -log_p_0
-        return nll, x_1, logdetjac, log_p_1
+        x_0, logdetjac = aug_output[..., :-1], aug_output[..., -1]
+        log_p_0 = prior.log_prob(x_0)
+        log_p_1 = log_p_0 + logdetjac
+        nll = -log_p_1
+        return nll, x_0, logdetjac, log_p_0
 
-    def on_train_epoch_end(self) -> None:
-        "Lightning hook that is called when a training epoch ends."
+    def compute_and_log_energy_w2(self, stage):
+        ground_truth_sample = self.generate_ground_truth_sample(
+            stage, self.eval_batch_size
+        )
+        true_energies = self.energy_function(
+            self.energy_function.normalize(ground_truth_sample)
+        )
 
-        self.last_samples = self.generate_samples()
-        self.last_energies = self.energy_function(self.last_samples)
-
-        self.buffer.add(self.last_samples, self.last_energies)
-
-        self._log_energy_w2(prefix="val")
-
-        if self.energy_function.is_molecule:
-            self._log_dist_w2(prefix="val")
-            self._log_dist_total_var(prefix="val")
-
-    def _log_energy_w2(self, prefix="val"):
-        if prefix == "test":
-            data_set = self.energy_function.sample_val_set(self.eval_batch_size)
-            generated_samples = self.generate_samples(
-                num_samples=self.eval_batch_size
-            )
+        # Generate sample and get energy
+        if stage == "test":
+            generated_samples = self.generate_samples(num_samples=self.eval_batch_size)
             generated_energies = self.energy_function(generated_samples)
-        else:
+        elif stage == "val":
             if len(self.buffer) < self.eval_batch_size:
                 return
-            data_set = self.energy_function.sample_test_set(self.eval_batch_size)
-            _, generated_energies = self.buffer.get_last_n_inserted(self.eval_batch_size)
+            _, generated_energies = self.buffer.get_last_n_inserted(
+                self.eval_batch_size
+            )
+        else:
+            raise Exception("Invalid stage")
 
-        energies = self.energy_function(self.energy_function.normalize(data_set))
-        energy_w2 = pot.emd2_1d(energies.cpu().numpy(), generated_energies.cpu().numpy())
+        # Calculate w2 on energy distribution
+        energy_w2 = pot.emd2_1d(
+            true_energies.cpu().numpy(), generated_energies.cpu().numpy()
+        )
 
         self.log(
-            f"{prefix}/energy_w2",
+            f"{stage}/energy_w2",
             self.val_energy_w2(energy_w2),
             on_step=False,
             on_epoch=True,
             prog_bar=True,
         )
 
-    def _log_dist_w2(self, prefix="val"):
-        if prefix == "test":
-            data_set = self.energy_function.sample_val_set(self.eval_batch_size)
-            generated_samples = self.generate_samples(
-                num_samples=self.eval_batch_size
-            )
+    def compute_and_log_dist_w2(self, stage="val"):
+        data_set = self.generate_ground_truth_sample(stage, self.eval_batch_size)
+
+        if stage == "test":
+            generated_samples = self.generate_samples(num_samples=self.eval_batch_size)
         else:
             if len(self.buffer) < self.eval_batch_size:
                 return
-            data_set = self.energy_function.sample_test_set(self.eval_batch_size)
             generated_samples, _ = self.buffer.get_last_n_inserted(self.eval_batch_size)
 
         dist_w2 = pot.emd2_1d(
-            self.energy_function.interatomic_dist(generated_samples).cpu().numpy().reshape(-1),
+            self.energy_function.interatomic_dist(generated_samples)
+            .cpu()
+            .numpy()
+            .reshape(-1),
             self.energy_function.interatomic_dist(data_set).cpu().numpy().reshape(-1),
         )
+
         self.log(
-            f"{prefix}/dist_w2",
+            f"{stage}/dist_w2",
             self.val_dist_w2(dist_w2),
             on_step=False,
             on_epoch=True,
             prog_bar=True,
         )
 
-    def _log_dist_total_var(self, prefix="val"):
-        if prefix == "test":
-            data_set = self.energy_function.sample_val_set(self.eval_batch_size)
-            generated_samples = self.generate_samples(
-                num_samples=self.eval_batch_size
-            )
+    def compute_and_log_dist_total_var(self, stage="val"):
+        data_set = self.generate_ground_truth_sample(stage, self.eval_batch_size)
+
+        if stage == "test":
+            generated_samples = self.generate_samples(num_samples=self.eval_batch_size)
         else:
             if len(self.buffer) < self.eval_batch_size:
                 return
-            data_set = self.energy_function.sample_test_set(self.eval_batch_size)
             generated_samples, _ = self.buffer.get_last_n_inserted(self.eval_batch_size)
 
         generated_samples_dists = (
-            self.energy_function.interatomic_dist(generated_samples).cpu().numpy().reshape(-1),
+            self.energy_function.interatomic_dist(generated_samples)
+            .cpu()
+            .numpy()
+            .reshape(-1),
         )
-        data_set_dists = self.energy_function.interatomic_dist(data_set).cpu().numpy().reshape(-1)
+        data_set_dists = (
+            self.energy_function.interatomic_dist(data_set).cpu().numpy().reshape(-1)
+        )
 
         H_data_set, x_data_set = np.histogram(data_set_dists, bins=200)
-        H_generated_samples, _ = np.histogram(generated_samples_dists, bins=(x_data_set))
+        H_generated_samples, _ = np.histogram(
+            generated_samples_dists, bins=(x_data_set)
+        )
         total_var = (
             0.5
             * np.abs(
-                H_data_set / H_data_set.sum() - H_generated_samples / H_generated_samples.sum()
+                H_data_set / H_data_set.sum()
+                - H_generated_samples / H_generated_samples.sum()
             ).sum()
         )
 
         self.log(
-            f"{prefix}/dist_total_var",
+            f"{stage}/dist_total_var",
             self.val_dist_total_var(total_var),
             on_step=False,
             on_epoch=True,
@@ -527,13 +655,21 @@ class EFMLitModule(LightningModule):
             prog_bar=True,
         )
 
-    def compute_and_log_nll(self, cnf, prior, samples, prefix, name):
+    def compute_and_log_nll(self, cnf, prior, samples, stage, name):
+        # Choose proper metric functions (for given stage and model)
+        nfe_metric = getattr(self, f"{stage}_{name}nfe")
+        nll_metric = getattr(self, f"{stage}_{name}nll")
+        logdetjac_metric = getattr(self, f"{stage}_{name}nll_logdetjac")
+        log_p_1_metric = getattr(self, f"{stage}_{name}nll_log_p_1")
+
         cnf.nfe = 0.0
-        nll, forwards_samples, logdetjac, log_p_1 = self.compute_nll(cnf, prior, samples)
-        nfe_metric = getattr(self, f"{prefix}_{name}nfe")
-        nll_metric = getattr(self, f"{prefix}_{name}nll")
-        logdetjac_metric = getattr(self, f"{prefix}_{name}nll_logdetjac")
-        log_p_1_metric = getattr(self, f"{prefix}_{name}nll_log_p_1")
+
+        # Compute NLL
+        nll, forwards_samples, logdetjac, log_p_1 = self.compute_nll(
+            cnf, prior, samples
+        )
+
+        # Log NLL
         nfe_metric.update(cnf.nfe)
         nll_metric.update(nll)
         logdetjac_metric.update(logdetjac)
@@ -541,138 +677,176 @@ class EFMLitModule(LightningModule):
 
         self.log_dict(
             {
-                f"{prefix}/{name}_nfe": nfe_metric,
-                f"{prefix}/{name}nll_logdetjac": logdetjac_metric,
-                f"{prefix}/{name}nll_log_p_1": log_p_1_metric,
-                # f"{prefix}/{name}logz": logz_metric,
+                f"{stage}/{name}_nfe": nfe_metric,
+                f"{stage}/{name}nll_logdetjac": logdetjac_metric,
+                f"{stage}/{name}nll_log_p_1": log_p_1_metric,
             },
             on_epoch=True,
         )
+
         self.log(
-            f"{prefix}/{name}nll",
+            f"{stage}/{name}nll",
             nll_metric,
             on_step=False,
             on_epoch=True,
             prog_bar=True,
         )
-        return forwards_samples
 
-    def _fixed_time_forward(self, t):
-        def _fxn(x):
-            return self.forward(t.repeat(x.size(0)), x)
-        return _fxn
+    def generate_ground_truth_sample(self, stage: str, size: int) -> torch.Tensor:
+        if stage == "val":
+            ground_truth_sample = self.energy_function.sample_val_set(size)
+        elif stage == "test":
+            ground_truth_sample = self.energy_function.sample_test_set(size)
+        else:
+            raise Exception("Invalid stage")
 
-    def log_vecfield_error_plot(self) -> None:
-        true_vf = partial(
-            estimate_VF_for_fixed_time,
-            torch.tensor(0.5, device=self.device),
-            energy_function=self.energy_function,
-            noise_schedule=self.noise_schedule,
-            num_mc_samples=1000,
-            device=self.device,
-            option=self.prob_path
-        )
-        est_vf = self._fixed_time_forward(torch.tensor(0.5, device=self.device))
+        return ground_truth_sample
 
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        plot_vecfield_error(fig, ax, true_vf, est_vf, grid_step=40, device=self.device)
-        fig.savefig(f"./figure/GMM-Net-VF-error.png")
-
-    def eval_step(self, prefix: str, batch: torch.Tensor, batch_idx: int) -> None:
-        """Perform a single eval step on a batch of data from the validation set.
-
-        :param batch: A batch of data (a tuple) containing the input tensor of images and target
-            labels.
-        :param batch_idx: The index of the current batch.
-        """
-        if prefix == "test":
-            batch = self.energy_function.sample_test_set(self.eval_batch_size)
-        elif prefix == "val":
-            batch = self.energy_function.sample_val_set(self.eval_batch_size)
-
-        if self.energy_function.name == "gmm":
-            self.log_vecfield_error_plot()
-
+    def get_sample_for_evaluation(self, size: int) -> torch.Tensor:
+        # Evaluation on lastly generated sample
         sample = self.last_samples
 
-        # generate samples noise --> data if needed
+        # Generate samples if needed
         if sample is None or self.eval_batch_size > len(sample):
             sample = self.generate_samples(self.eval_batch_size)
 
-        # sample eval_batch_size from generated samples from dem to match dimensions
-        # required for distribution metrics
-        if len(sample) != self.eval_batch_size:
+        # Discard some sample to match the size if too much
+        elif len(sample) > self.eval_batch_size:
             indices = torch.randperm(len(sample))[: self.eval_batch_size]
             sample = sample[indices]
 
-        if batch is None:
-            print("Warning batch is None skipping eval")
-            self.eval_step_outputs.append({"gen_0": sample})
-            return
+        return sample
 
-        times = self.sample_time(
-            num_samples=self.eval_batch_size,
-            device=batch.device,
+    def eval_nll_with_efm(self, stage, ground_truth_sample):
+        ground_truth_sample = self.energy_function.normalize(ground_truth_sample)
+
+        self.compute_and_log_nll(
+            self.efm_cnf, self.prior, ground_truth_sample, stage, "dem_"
         )
 
-        noised_batch = self.sample_noisy_data(
-            times=times,
-            origins=batch,
+        self.compute_log_z(self.efm_cnf, self.prior, ground_truth_sample, stage, "dem_")
+
+    def eval_nll_with_cfm(self, stage, sample):
+        self.compute_and_log_nll(self.cfm_cnf, self.cfm_prior, sample, stage, "")
+
+    def eval_logz_with_cfm(self, stage):
+        backwards_samples = self.cfm_cnf.generate(
+            self.cfm_prior.sample(self.eval_batch_size),
+        )[-1]
+
+        self.compute_log_z(self.cfm_cnf, self.cfm_prior, backwards_samples, stage, "")
+
+    def eval_step(self, stage: str) -> None:
+        """
+        Perform a single eval step.
+        Compare ground_truth_sample and generated sample
+        and log sample quality metric
+        :param stage: test or val
+        """
+        loss_fn = getattr(self, f"{stage}_loss")
+
+        ground_truth_sample = self.generate_ground_truth_sample(
+            stage, self.eval_batch_size
         )
 
-        loss = self.get_loss(times, noised_batch).mean(-1)
+        generated_sample = self.get_sample_for_evaluation(self.eval_batch_size)
 
-        # update and log metrics
-        loss_metric = self.val_loss if prefix == "val" else self.test_loss
-        loss_metric(loss)
+        # Calculate and log loss
+        loss, _, _ = self.get_EFM_loss(ground_truth_sample)
+        loss_fn(loss.mean(-1))
+        self.log(f"{stage}/loss", loss_fn, on_step=True, on_epoch=True, prog_bar=True)
 
-        self.log(f"{prefix}/loss", loss_metric, on_step=True, on_epoch=True, prog_bar=True)
+        if self.should_eval_nll_with_efm:
+            self.eval_nll_with_efm(stage, ground_truth_sample)
 
-        to_log = {
-            "data_0": batch,
-            "gen_0": sample,
-        }
+        if self.should_eval_nll_with_cfm:
+            self.eval_nll_with_cfm(stage, ground_truth_sample)
 
-        if self.nll_with_dem:
-            batch = self.energy_function.normalize(batch)
-            forwards_samples = self.compute_and_log_nll(
-                self.efm_cnf, self.prior, batch, prefix, "dem_"
-            )
-            to_log["gen_1_dem"] = forwards_samples
-            self.compute_log_z(self.efm_cnf, self.prior, sample, prefix, "dem_")
+            # compute nll on buffer if not training cfm only
+            if not self.hparams.debug_use_train_data and self.should_eval_nll_on_buffer:
+                sample_from_buffer, _, _ = self.buffer.sample(self.eval_batch_size)
+                self.eval_nll_with_cfm(stage, sample_from_buffer)
 
-        self.eval_step_outputs.append(to_log)
+            if self.should_compute_nll_on_train_data:
+                sample_from_train_set = self.energy_function.sample_train_set(
+                    self.eval_batch_size
+                )
+                self.eval_nll_with_cfm(stage, sample_from_train_set)
+
+        if self.should_eval_logz_with_cfm:
+            self.eval_logz_with_cfm(stage)
+
+        self.eval_step_outputs.append(
+            {
+                "data": ground_truth_sample,
+                "gen": generated_sample,
+            }
+        )
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int) -> None:
-        self.eval_step("val", batch, batch_idx)
+        self.eval_step("val")
 
     def test_step(self, batch: torch.Tensor, batch_idx: int) -> None:
-        self.eval_step("test", batch, batch_idx)
+        self.eval_step("test")
 
-    def eval_epoch_end(self, prefix: str):
+    def log_with_energy_function(self, stage: str):
         wandb_logger = get_wandb_logger(self.loggers)
-        # convert to dict of tensors assumes [batch, ...]
-        outputs = {
-            k: torch.cat([dic[k] for dic in self.eval_step_outputs], dim=0)
-            for k in self.eval_step_outputs[0]
-        }
+
+        if self.should_eval_nll_with_cfm:
+            buffer_samples, _, _ = self.buffer.sample(
+                self.eval_batch_size,
+            )
+
+            cfm_samples = self.cfm_cnf.generate(
+                self.cfm_prior.sample(self.eval_batch_size),
+            )[-1]
+        else:
+            buffer_samples, cfm_samples = None, None
 
         self.energy_function.log_on_epoch_end(
             self.last_samples,
             self.last_energies,
             wandb_logger,
+            unprioritized_buffer_samples=buffer_samples,
+            cfm_samples=cfm_samples,
+            replay_buffer=self.buffer,
         )
 
-        if "data_0" in outputs:
-            # pad with time dimension 1
-            names, dists = compute_distribution_distances(
-                self.energy_function.unnormalize(outputs["gen_0"])[:, None],
-                outputs["data_0"][:, None],
-                self.energy_function,
+    def compute_and_log_distribution_distances(
+        self,
+        stage,
+        ground_truth_sample,
+        generated_sample,
+    ) -> None:
+
+        generated_sample = self.energy_function.unnormalize(generated_sample)[:, None]
+        ground_truth_sample = ground_truth_sample[:, None]
+
+        names, dists = compute_distribution_distances(
+            generated_sample,
+            ground_truth_sample,
+            self.energy_function,
+        )
+
+        names = [f"{stage}/{name}" for name in names]
+        d = dict(zip(names, dists))
+        self.log_dict(d, sync_dist=True)
+
+    def eval_epoch_end(self, stage: str):
+        self.log_with_energy_function(stage)
+
+        # convert to dict of tensors assumes [batch, ...]
+        outputs = {
+            name: torch.cat([output[name] for output in self.eval_step_outputs], dim=0)
+            for name in ["data", "gen"]
+        }
+
+        if "data" in outputs:
+            self.compute_and_log_distribution_distances(
+                stage,
+                outputs["data"],
+                outputs["gen"],
             )
-            names = [f"{prefix}/{name}" for name in names]
-            d = dict(zip(names, dists))
-            self.log_dict(d, sync_dist=True)
 
         self.eval_step_outputs.clear()
 
@@ -683,10 +857,6 @@ class EFMLitModule(LightningModule):
         wandb_logger = get_wandb_logger(self.loggers)
 
         self.eval_epoch_end("test")
-        # self._log_energy_w2(prefix="test")
-        # if self.energy_function.is_molecule:
-        #     self._log_dist_w2(prefix="test")
-        #     self._log_dist_total_var(prefix="test")
 
         batch_size = 1000
         final_samples = []
@@ -694,9 +864,7 @@ class EFMLitModule(LightningModule):
         print("Generating samples")
         for i in range(n_batches):
             start = time.time()
-            samples = self.generate_samples(
-                num_samples=batch_size
-            )
+            samples = self.generate_samples(num_samples=batch_size)
             final_samples.append(samples)
             end = time.time()
             print(f"batch {i} took {end - start:0.2f}s")
@@ -730,7 +898,11 @@ class EFMLitModule(LightningModule):
         :param stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
         """
 
-        self.prior = self.partial_prior(device=self.device, scale=self.noise_schedule.h(0) ** 0.5)
+        self.prior = self.partial_prior(
+            device=self.device, scale=self.noise_schedule.h(0) ** 0.5
+        )
+
+        # Buffer initialization
         if self.init_from_prior:
             init_states = self.prior.sample(self.num_init_samples)
         else:
@@ -739,8 +911,14 @@ class EFMLitModule(LightningModule):
 
         self.buffer.add(init_states, init_energies)
 
+        if self.should_eval_nll_with_cfm:
+            self.cfm_prior = self.partial_prior(
+                device=self.device, scale=self.cfm_prior_std
+            )
+
         if self.hparams.compile and stage == "fit":
             self.net = torch.compile(self.net)
+            self.cfm_net = torch.compile(self.cfm_net)
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.

@@ -6,46 +6,38 @@
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-tags: ["DW4", "iEFM", "OT"]
+tags: ["LJ13", "iEFM", "OT"]
 
 seed: 12345
 
 logger:
   wandb:
     tags: ${tags}
-    group: "dw4_efm_OT"
+    group: "lj13_efm_OT"
 
 defaults:
-  - override /energy: dw4
+  - override /energy: lj13
   - override /model: efm
   - override /model/net: egnn
 
-optimizer:
-  lr: 1e-3
-
 model:
   prob_path: OT
-  ode_start_time: 0.006
+  ode_start_time: 0.01
 
   net:
-    n_particles: 4
-    n_layers: 3
+    n_layers: 5
     hidden_nf: 128
-    n_dimension: 2
 
   noise_schedule:
+    _target_: dem.models.components.noise_schedules.OTcnfNoiseSchedule
     sigma_min: 0.00001
     sigma_max: 0.03
-
-  nll_with_dem: true
-  nll_with_cfm: false
-  use_otcfm: false
 
   partial_prior:
     _target_: dem.energies.base_prior.MeanFreePrior
     _partial_: true
-    n_particles: 4
-    spatial_dim: 2
+    n_particles: 13
+    spatial_dim: 3
 
   lambda_weighter:
     _target_: dem.models.components.lambda_weighter.NoLambdaWeighter
@@ -55,16 +47,17 @@ model:
     _target_: dem.models.components.clipper.Clipper
     should_clip_scores: False
     should_clip_log_rewards: False
-    max_score_norm: 10
+    max_score_norm: 20
     min_log_reward: null
 
-  diffusion_scale: 1
+  diffusion_scale: 0.9
   num_samples_to_generate_per_epoch: 1000
+  num_samples_to_sample_from_buffer: 512
 
   init_from_prior: true
 
   eval_batch_size: 1000
 
-  num_estimator_mc_samples: 3000
+  num_estimator_mc_samples: 1000
 
   nll_integration_method: dopri5

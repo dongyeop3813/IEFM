@@ -1,0 +1,3 @@
+_target_: dem.models.components.noise_schedules.SqrtNoiseSchedule
+sigma_min: 0.00001
+sigma_max: 40.00

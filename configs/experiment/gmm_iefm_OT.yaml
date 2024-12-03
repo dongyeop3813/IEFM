@@ -26,6 +26,10 @@ model:
     sigma_min: 0.00001
     sigma_max: 0.02
 
+  nll_with_dem: true
+  nll_with_cfm: true
+  use_otcfm: true
+
   partial_prior:
     _target_: dem.energies.base_prior.Prior
     _partial_: true

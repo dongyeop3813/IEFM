@@ -8,11 +8,14 @@
 defaults:
   - override /energy: gmm
   - override /model: efm
-  - override /model/noise_schedule: VEcnf
 
-tags: ["GMM", "iEFM", "VE"]
+tags: ["GMM", "iEFM", "OT"]
 
 seed: 12345
+
+energy:
+  should_unnormalize: false
+  data_normalization_factor: 1.0
 
 logger:
   wandb:
@@ -20,19 +23,16 @@ logger:
     group: "gmm_iefm"
 
 model:
-  prob_path: VE
-  ode_start_time: 0.00
+  prob_path: OT
+  ode_start_time: 0.01
+
+  noise_schedule:
+    sigma_min: 0.0002
+    sigma_max: 1.0
 
   nll_with_dem: true
   nll_with_cfm: true
   use_otcfm: true
-
-  buffer:
-    prioritize: false
-
-  noise_schedule:
-    sigma_min: 0.00001
-    sigma_max: 1.0
 
   partial_prior:
     _target_: dem.energies.base_prior.Prior
@@ -46,9 +46,13 @@ model:
     max_score_norm: 70
     min_log_reward: null
 
+  buffer:
+    prioritize: false
+
   lambda_weighter:
     _target_: dem.models.components.lambda_weighter.NoLambdaWeighter
     _partial_: true
+    epsilon: 1e-3
 
   optimizer:
     lr: 5e-4

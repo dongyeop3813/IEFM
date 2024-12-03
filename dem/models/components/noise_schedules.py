@@ -71,7 +71,11 @@ class GeometricNoiseSchedule(BaseNoiseSchedule):
         # Let sigma_d = sigma_max / sigma_min
         # Then g(t) = sigma_min * sigma_d^t * sqrt{2 * log(sigma_d)}
         # See Eq 192 in https://arxiv.org/pdf/2206.00364.pdf
-        return self.sigma_min * (self.sigma_diff**t) * ((2 * np.log(self.sigma_diff)) ** 0.5)
+        return (
+            self.sigma_min
+            * (self.sigma_diff**t)
+            * ((2 * np.log(self.sigma_diff)) ** 0.5)
+        )
 
     def h(self, t):
         # Let sigma_d = sigma_max / sigma_min
@@ -84,7 +88,7 @@ class OTcnfNoiseSchedule(BaseNoiseSchedule):
     def __init__(self, sigma_min, sigma_max=1.0):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
-        self.sigma_diff = sigma_min / sigma_max
+        self.sigma_diff = sigma_max - sigma_min
 
     def g(self, t):
         raise NotImplementedError
@@ -92,9 +96,13 @@ class OTcnfNoiseSchedule(BaseNoiseSchedule):
     def h(self, t):
         # Noise schedule of OT probability path
         # see Eq 20 in (Flow matching, Lipman et al., 2023)
-        return (
-            self.sigma_max - (self.sigma_max - self.sigma_min) * t
-        ) ** 2
+        return (self.sigma_max - self.sigma_diff * t) ** 2
+
+    def sigma(self, t):
+        return self.sigma_max - self.sigma_diff * t
+
+    def sigma_prime(self, t):
+        return -torch.full_like(t, self.sigma_diff)
 
 
 class VEcnfNoiseSchedule(BaseNoiseSchedule):
@@ -102,7 +110,7 @@ class VEcnfNoiseSchedule(BaseNoiseSchedule):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_diff = sigma_min / sigma_max
-        self.c = torch.log(torch.tensor(self.sigma_diff))
+        self.c = np.log(self.sigma_diff)
 
     def g(self, t):
         raise NotImplementedError
@@ -110,9 +118,13 @@ class VEcnfNoiseSchedule(BaseNoiseSchedule):
     def h(self, t):
         # Noise schedule of OT probability path
         # see Eq 20 in (Flow matching, Lipman et al., 2023)
-        return (
-            self.sigma_max * ((self.sigma_diff) ** t)
-        ) ** 2
+        return (self.sigma_max * ((self.sigma_diff) ** t)) ** 2
+
+    def sigma(self, t):
+        return self.sigma_max * ((self.sigma_diff) ** t)
+
+    def sigma_prime(self, t):
+        return self.sigma_max * self.c * ((self.sigma_diff) ** t)
 
 
 class RevGeometricNoiseSchedule(BaseNoiseSchedule):
@@ -128,6 +140,23 @@ class RevGeometricNoiseSchedule(BaseNoiseSchedule):
         # Let sigma_d = sigma_max / sigma_min
         # Then h(t) = \int_0^t g(z)^2 dz = sigma_min * sqrt{sigma_d^{2t} - 1}
         # see Eq 199 in https://arxiv.org/pdf/2206.00364.pdf
-        return (
-            self.sigma_max * ((self.sigma_diff) ** (1-t))
-        ) ** 2
+        return (self.sigma_max * ((self.sigma_diff) ** (1 - t))) ** 2
+
+
+class SqrtNoiseSchedule(BaseNoiseSchedule):
+    def __init__(self, sigma_min, sigma_max=1.0):
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_diff = sigma_max**2 - sigma_min**2
+
+    def g(self, t):
+        raise NotImplementedError
+
+    def h(self, t):
+        return self.sigma_max**2 - self.sigma_diff * t
+
+    def sigma(self, t):
+        return (self.sigma_max**2 - self.sigma_diff * t) ** 0.5
+
+    def sigma_prime(self, t):
+        return -self.sigma_diff / (2 * self.sigma(t))

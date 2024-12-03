@@ -14,6 +14,10 @@ tags: ["GMM", "iEFM", "VE"]
 
 seed: 12345
 
+energy:
+  should_unnormalize: false
+  data_normalization_factor: 1.0
+
 logger:
   wandb:
     tags: ${tags}
@@ -31,8 +35,8 @@ model:
     prioritize: false
 
   noise_schedule:
-    sigma_min: 0.00001
-    sigma_max: 1.0
+    sigma_min: 0.002
+    sigma_max: 50.0
 
   partial_prior:
     _target_: dem.energies.base_prior.Prior
