@@ -13,10 +13,6 @@ For installation, we recommend the use of Micromamba. Please refer [here](https:
 First, we install dependencies
 
 ```bash
-# clone project
-git clone git@github.com:jarridrb/DEM.git
-cd DEM
-
 # create micromamba environment
 micromamba create -f environment.yaml
 micromamba activate dem
